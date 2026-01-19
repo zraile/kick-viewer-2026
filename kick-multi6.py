@@ -82,12 +82,15 @@ def create_container(index, base_port):
     run_cmd(f"docker rm -f {name}")
     port_mappings = " ".join([f"-p {base_port + i}:{9050 + i}" for i in range(PORTS_PER_CONTAINER)])
     cmd = f"docker run -d --name {name} {port_mappings} {DOCKER_IMAGE}"
-    success, _ = run_cmd(cmd)
+    success, output = run_cmd(cmd)
     if success:
         containers.append(name)
         for i in range(PORTS_PER_CONTAINER):
             all_ports.append(base_port + i)
         return True
+    else:
+        # DEBUG: Show why container creation failed
+        print(f"\n[DEBUG] Container {name} failed to start. Check Docker Desktop is running.")
     return False
 
 def cleanup_containers():
@@ -144,7 +147,11 @@ def fetch_token(port=None):
         if response.status_code == 200:
             data = response.json()
             return data.get("data", {}).get("token")
-    except:
+    except Exception as e:
+        # DEBUG: Log connection errors to help troubleshoot proxy issues
+        error_msg = str(e)
+        if "connection" in error_msg.lower() or "refused" in error_msg.lower():
+            print(f"\n[DEBUG] Port {port} connection error: {error_msg}")
         pass
     return None
 
@@ -352,9 +359,21 @@ def run(channel_name):
     for _ in range(TOKEN_PRODUCERS):
         Thread(target=token_producer, daemon=True).start()
     print("[*] Filling token pool...")
+    
+    # DEBUG: Track token generation progress
+    token_errors = 0
+    start_fill = time.time()
+    
     while token_queue.qsize() < INITIAL_POOL_WAIT:
         time.sleep(0.3)
         print(f"\r[*] Tokens: {token_queue.qsize()}/{INITIAL_POOL_WAIT}", end="")
+        
+        # DEBUG: Warn if token generation is too slow
+        if time.time() - start_fill > 30 and token_queue.qsize() < 10:
+            print(f"\n[DEBUG] WARNING: Token generation is very slow. Only {token_queue.qsize()} tokens in 30s.")
+            print("[DEBUG] This usually means SOCKS proxies are not responding.")
+            print("[DEBUG] Check: 1) Docker containers running 2) Ports not blocked 3) Tor bootstrap complete")
+            
     print(f"\n[+] Token pool ready: {token_queue.qsize()}")
     
     Thread(target=show_stats, daemon=True).start()
@@ -408,6 +427,15 @@ if __name__ == "__main__":
                 print(" FAILED")
         
         print(f"\n[+] Created {len(containers)} containers with {len(all_ports)} total ports")
+        
+        # DEBUG: Verify containers are running
+        print("[DEBUG] Checking container status...")
+        success, output = run_cmd("docker ps --filter name=multitor_ --format '{{.Names}} - {{.Status}}'")
+        if success and output:
+            print(f"[DEBUG] Running containers:\n{output}")
+        else:
+            print("[DEBUG] WARNING: No containers found running! Check Docker Desktop.")
+        
         print("[*] Waiting 45s for Tor instances to bootstrap...")
         time.sleep(45)
         
