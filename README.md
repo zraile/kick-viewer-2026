@@ -55,13 +55,6 @@ python kick-multi6.py
 3. Wait for Tor bootstrap
 4. Enter channel name
 
-## Performance Comparison
-
-| Version | For 90 Ports | RAM Usage | Stability |
-|---------|--------------|-----------|-----------|
-| kick-single.py | 90 containers | ~9 GB | Very stable |
-| kick-multi6.py | 15 containers | ~2 GB | Stable |
-| kick-multi3.py | 30 containers | ~3 GB | Stable |
 
 ## Stats Explained
 
