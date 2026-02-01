@@ -6,6 +6,8 @@ A robust Kick.com viewbot using Docker and multiple Tor instances to bypass rate
 
 I've added a `run.bat` file to handle all the boring stuff for you. You no longer need to manually install dependencies or check if Docker is ready.
 
+**Prerequisite:** Make sure **Docker Desktop** is installed and **WSL 2** is enabled in Docker settings (Settings > General > Use the WSL 2 based engine).
+
 1.  **Start Docker Desktop** and wait for it to initialize.
 2.  **Double-click run.bat**.
 3.  The script will automatically:
