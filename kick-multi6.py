@@ -126,9 +126,17 @@ def get_channel_info(name):
             channel_id = data.get("id")
             if 'livestream' in data and data['livestream']:
                 stream_id = data['livestream'].get('id')
+            else:
+                print(f"\n\033[33m[!] Channel ({name}) is currently OFFLINE or stream_id could not be fetched. Bot will run but viewers might not increase.\033[0m")
             return channel_id
+        elif response.status_code == 404:
+            print(f"\n\033[31m[!] ERROR: Channel '{name}' not found! Please check the username.\033[0m")
+        elif response.status_code == 403:
+            print(f"\n\033[31m[!] ERROR: Blocked by Kick API (Cloudflare 403). Try a different IP or wait for Tor rotation.\033[0m")
+        else:
+            print(f"\n\033[31m[!] ERROR: Unexpected Kick API response (Code: {response.status_code})\033[0m")
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"\n\033[31m[!] Connection error while fetching channel info: {e}\033[0m")
     return None
 
 
@@ -147,11 +155,12 @@ def fetch_token(port=None):
         if response.status_code == 200:
             data = response.json()
             return data.get("data", {}).get("token")
+        elif response.status_code == 403:
+            # Kick is blocking the proxy
+            pass 
     except Exception as e:
-        # DEBUG: Log connection errors to help troubleshoot proxy issues
-        error_msg = str(e)
-        if "connection" in error_msg.lower() or "refused" in error_msg.lower():
-            print(f"\n[DEBUG] Port {port} connection error: {error_msg}")
+        # We don't want to spam the console here as it's a worker thread,
+        # but stats show misses which is enough for the user to see things are slow.
         pass
     return None
 
@@ -396,58 +405,71 @@ def run(channel_name):
 if __name__ == "__main__":
     try:
         os.system('cls' if os.name == 'nt' else 'clear')
-        print("=== Kick Viewer Bot (Multi-Tor Docker) ===\n")
+        print("\033[94m" + "="*50)
+        print("   KICK VIEWER BOT - MULTI-TOR DOCKER EDITION   ")
+        print("="*50 + "\033[0m\n")
         
         if not FULL_SUPPORT:
-            print("\033[31m[!] pip install aiohttp aiohttp-socks\033[0m")
+            print("\n\033[31m[!] Missing required libraries! Please run 'run.bat' or install manually:\033[0m")
+            print("    pip install aiohttp aiohttp-socks tls-client")
             sys.exit(1)
         
+        # Docker Check
+        print("[*] Checking Docker status...")
         success, _ = run_cmd("docker --version")
         if not success:
-            print("\033[31m[!] Docker not found!\033[0m")
+            print("\n\033[31m[!] ERROR: Docker not found!\033[0m")
+            print("    Please make sure Docker Desktop is installed and added to PATH.")
+            input("\nPress any key to exit...")
+            sys.exit(1)
+
+        success, output = run_cmd("docker ps")
+        if not success:
+            print("\n\033[31m[!] ERROR: Docker is not running!\033[0m")
+            print("    Please start Docker Desktop and try again once it's ready.")
+            input("\nPress any key to exit...")
             sys.exit(1)
         
         if not build_image():
-            print("\033[31m[!] Failed to build image\033[0m")
+            print("\n\033[31m[!] ERROR: Failed to build Docker image (multitor).\033[0m")
+            print("    Check if Dockerfile.multitor exists and you have internet connection.")
             sys.exit(1)
         
-        num_containers = int(input("Number of containers (e.g. 10): ").strip() or "10")
-        base_port = int(input("Base port (default 19050): ").strip() or "19050")
+        print("\n\033[92m[+] Docker is Ready!\033[0m")
+        num_containers = int(input("\nNumber of Containers (Recommended 10): ").strip() or "10")
+        base_port = int(input("Starting Base Port (Default 19050): ").strip() or "19050")
         
         calculate_token_settings(num_containers)
-        print(f"[*] Token settings: Pool={TOKEN_POOL_SIZE}, Wait={INITIAL_POOL_WAIT}, Producers={TOKEN_PRODUCERS}")
         
-        print(f"\n[*] Creating {num_containers} containers ({PORTS_PER_CONTAINER} Tor instances each)...")
+        print(f"\n[*] Creating {num_containers} containers. This may take a moment...")
         for i in range(num_containers):
             container_base = base_port + (i * PORTS_PER_CONTAINER)
-            print(f"[*] Container {i+1}/{num_containers} ports {container_base}-{container_base + PORTS_PER_CONTAINER - 1}...", end="")
-            if create_container(i, container_base):
-                print(" OK")
-            else:
-                print(" FAILED")
+            print(f"\r[*] Progress: {i+1}/{num_containers} (Port {container_base})", end="", flush=True)
+            if not create_container(i, container_base):
+                print(f"\n\033[33m[!] Warning: Could not create container {i+1}. Check Docker resources.\033[0m")
         
-        print(f"\n[+] Created {len(containers)} containers with {len(all_ports)} total ports")
-        
-        # DEBUG: Verify containers are running
-        print("[DEBUG] Checking container status...")
-        success, output = run_cmd("docker ps --filter name=multitor_ --format '{{.Names}} - {{.Status}}'")
-        if success and output:
-            print(f"[DEBUG] Running containers:\n{output}")
-        else:
-            print("[DEBUG] WARNING: No containers found running! Check Docker Desktop.")
+        print(f"\n\n\033[92m[+] Created {len(containers)} containers with {len(all_ports)} Tor ports!\033[0m")
         
         print("[*] Waiting 45s for Tor instances to bootstrap...")
-        time.sleep(45)
+        for i in range(45, 0, -1):
+            print(f"\rTime Remaining: {i}s... ", end="", flush=True)
+            time.sleep(1)
         
-        channel_input = input("\nChannel: ").strip()
+        print("\n")
+        channel_input = input("Target Channel Name or Link: ").strip()
         if not channel_input:
+            print("\033[31m[!] No channel entered, cleaning up...\033[0m")
             cleanup_containers()
             sys.exit(1)
         
         run(channel_input)
     except KeyboardInterrupt:
         stop = True
-        print("\n[*] Cleaning up containers...")
+        print("\n\n\033[33m[*] Shutting down, please wait. Removing containers...\033[0m")
         cleanup_containers()
-        print("Stopped.")
+        print("\033[92m[+] Cleanup complete. Goodbye!\033[0m")
         sys.exit(0)
+    except Exception as e:
+        print(f"\n\033[31m[!] UNEXPECTED ERROR: {e}\033[0m")
+        cleanup_containers()
+        sys.exit(1)
