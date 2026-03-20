@@ -1,0 +1,5 @@
+# Her satıra bir yayıncı adı veya kick.com linki yazın
+# Boş satırlar ve # ile başlayan satırlar yoksayılır
+# Örnekler:
+# streamer1
+# https://kick.com/streamer2
