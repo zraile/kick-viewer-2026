@@ -121,8 +121,12 @@ class StreamerInfo:
         self.viewers = 0
         self.last_check = 0
         self.ws_errors = 0
+        self.pending_connections = 0
         self.active = True
         self.assigned_ports = []
+
+    def total_claimed(self):
+        return self.connections + self.pending_connections
 
     def time_remaining(self):
         elapsed = (datetime.datetime.now() - self.start_time).total_seconds()
@@ -464,6 +468,7 @@ async def ws_handler(session, token, streamer):
         ws = await session.ws_connect(url, timeout=aiohttp.ClientTimeout(total=30))
         with lock:
             streamer.connections += 1
+            streamer.pending_connections = max(0, streamer.pending_connections - 1)
         connected = True
 
         subscribe = {"event": "pusher:subscribe", "data": {"auth": "", "channel": f"channel.{streamer.channel_id}"}}
@@ -508,6 +513,7 @@ async def ws_handler(session, token, streamer):
     except:
         with lock:
             streamer.ws_errors += 1
+            streamer.pending_connections = max(0, streamer.pending_connections - 1)
     finally:
         if ws and not ws.closed:
             try:
@@ -554,27 +560,30 @@ async def run_port_pool(port, streamer_list):
                     if not streamer.channel_id:
                         continue
 
-                    # Global bağlantı kontrolü: hedef dolmuşsa bu yayıncıyı atla
-                    global_slots = streamer.target_viewers - streamer.connections
-                    if global_slots <= 0:
-                        continue
-
                     # Aktif taskları temizle
                     streamer_tasks = active_tasks.get(streamer.name, set())
                     streamer_tasks = {t for t in streamer_tasks if not t.done()}
                     active_tasks[streamer.name] = streamer_tasks
 
-                    # Bu port'tan en fazla 2 client gönder (tüm portlar paralel çalışıyor)
-                    local_slots = min(global_slots, 2) - len(streamer_tasks)
-                    if local_slots <= 0:
+                    # Atomic reservation: lock ile kontrol et ve reserve et
+                    reserved = 0
+                    with lock:
+                        claimed = streamer.connections + streamer.pending_connections
+                        available = streamer.target_viewers - claimed
+                        if available > 0:
+                            # Bu port'ta zaten aktif task varsa gönderme
+                            to_send = max(0, min(available, 1) - len(streamer_tasks))
+                            if to_send > 0:
+                                streamer.pending_connections += to_send
+                                reserved = to_send
+
+                    if reserved <= 0:
                         continue
 
                     # Token al ve bağlantı aç
-                    for _ in range(local_slots):
+                    actually_sent = 0
+                    for _ in range(reserved):
                         if stop or streamer.is_expired():
-                            break
-                        # Başka portlardan gelen bağlantılar hedefi doldurmuş olabilir
-                        if streamer.connections >= streamer.target_viewers:
                             break
                         token, _ = get_token_from_pool()
                         if not token:
@@ -585,9 +594,15 @@ async def run_port_pool(port, streamer_list):
                         streamer_tasks.add(task)
                         active_tasks[streamer.name] = streamer_tasks
                         spawned_any = True
-                        # Spawn delay sadece birden fazla client açılacaksa
-                        if local_slots > 1:
+                        actually_sent += 1
+                        if reserved > 1:
                             await asyncio.sleep(random.uniform(MIN_SPAWN_DELAY, MAX_SPAWN_DELAY))
+
+                    # Gönderilemeyen reserved'ları geri ver
+                    not_sent = reserved - actually_sent
+                    if not_sent > 0:
+                        with lock:
+                            streamer.pending_connections = max(0, streamer.pending_connections - not_sent)
 
                 # Ana döngü bekleme süresi
                 if spawned_any:
