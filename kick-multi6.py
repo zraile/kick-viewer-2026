@@ -1,4 +1,4 @@
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 import sys
 import time
@@ -9,7 +9,10 @@ import threading
 import asyncio
 import json
 import os
+import socket
 import subprocess
+import logging
+from logging.handlers import RotatingFileHandler
 from threading import Thread
 from queue import Queue, Empty
 import tls_client
@@ -63,10 +66,10 @@ MAX_SPAWN_DELAY = 2.0
 MIN_RECONNECT_DELAY = 1
 MAX_RECONNECT_DELAY = 5
 
-# ── v2.0.0 constants ──────────────────────────────────────────────────────────
+# ── v2.1.0 constants ──────────────────────────────────────────────────────────
 
 # Standby pool
-STANDBY_MAX_PER_STREAMER = 10
+STANDBY_MAX_PER_STREAMER = 15
 STANDBY_FILL_MIN_POOL = 50       # produce standby only when main pool has this many tokens
 STANDBY_TTL = 90                 # max age (seconds) for a standby token
 
@@ -75,13 +78,22 @@ TOKEN_MAX_AGE_SECONDS = 300      # tokens older than this are discarded from mai
 
 # Port health score system (0-100)
 PORT_HEALTH_INITIAL = 100
-PORT_HEALTH_SUCCESS_BONUS = 5
-PORT_HEALTH_FAIL_PENALTY = 15
-PORT_HEALTH_403_PENALTY = 30
-PORT_HEALTH_TIMEOUT_PENALTY = 10
-PORT_HEALTH_STANDBY_THRESHOLD = 70   # min health to produce standby tokens
+PORT_HEALTH_SUCCESS_BONUS = 10
+PORT_HEALTH_FAIL_PENALTY = 10
+PORT_HEALTH_403_PENALTY = 20
+PORT_HEALTH_TIMEOUT_PENALTY = 8
+PORT_HEALTH_STANDBY_THRESHOLD = 40   # min health to produce standby tokens
 PORT_HEALTH_COOLING_THRESHOLD = 30   # below this → cooling mode
 PORT_HEALTH_DEAD_THRESHOLD = 10      # below this → dead (longer cooling + NEWNYM)
+PORT_HEALTH_FLOOR = 5                # minimum health score (ports never fully die)
+PORT_HEALTH_COOLING_RECOVERY = 5     # passive health gain every 60s while cooling
+PORT_HEALTH_NEWNYM_RESET = 60        # health value after NEWNYM is sent
+
+# Dynamic port-client limit
+MAX_CLIENTS_PER_PORT_HARD_LIMIT = 5  # safety upper bound: max clients from one port
+
+# Standby production retry delay when no healthy port is available (seconds)
+STANDBY_PRODUCTION_RETRY_DELAY = 2
 
 PORT_COOLING_DURATION = 300          # seconds for cooling mode
 PORT_DEAD_DURATION = 600             # seconds for dead mode
@@ -126,6 +138,20 @@ def get_random_tls_id():
     return random.choice(TLS_CLIENT_IDENTIFIERS)
 
 
+# ── Logging setup ─────────────────────────────────────────────────────────────
+os.makedirs("logs", exist_ok=True)
+_log_handler = RotatingFileHandler(
+    "logs/kick-viewer.log",
+    maxBytes=10 * 1024 * 1024,  # 10 MB
+    backupCount=3,
+    encoding="utf-8",
+)
+_log_handler.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+logger = logging.getLogger("kick-viewer")
+logger.setLevel(logging.DEBUG)
+logger.addHandler(_log_handler)
+
+
 # ── Globals ───────────────────────────────────────────────────────────────────
 stop = False
 lock = threading.Lock()
@@ -139,6 +165,11 @@ port_blacklist = {}
 port_blacklist_lock = threading.Lock()
 port_health_scores = {}
 port_health_lock = threading.Lock()
+
+# Session cache for token fetching: {port: (session_object, last_used_timestamp)}
+SESSION_CACHE: dict = {}
+session_cache_lock = threading.Lock()
+SESSION_CACHE_TTL = 300  # reuse sessions up to 5 minutes
 port_cooling_until = {}
 global_base_port = 19050
 streamers = []
@@ -239,14 +270,18 @@ def update_port_health(port, delta):
     """Update health score for a port and apply cooling if needed."""
     with port_health_lock:
         current = port_health_scores.get(port, PORT_HEALTH_INITIAL)
-        new_score = max(0, min(100, current + delta))
+        new_score = max(PORT_HEALTH_FLOOR, min(100, current + delta))
         port_health_scores[port] = new_score
+        old_status = "GOOD" if current >= PORT_HEALTH_COOLING_THRESHOLD else ("COOLING" if current >= PORT_HEALTH_DEAD_THRESHOLD else "DEAD")
+        new_status = "GOOD" if new_score >= PORT_HEALTH_COOLING_THRESHOLD else ("COOLING" if new_score >= PORT_HEALTH_DEAD_THRESHOLD else "DEAD")
         if delta < 0 and new_score < PORT_HEALTH_COOLING_THRESHOLD:
             now = time.time()
             # Only set cooling if not already cooling (avoid repeated extension)
             if port_cooling_until.get(port, 0) < now:
                 duration = PORT_DEAD_DURATION if new_score < PORT_HEALTH_DEAD_THRESHOLD else PORT_COOLING_DURATION
                 port_cooling_until[port] = now + duration
+                if old_status != new_status:
+                    logger.warning(f"[HEALTH]  port:{port} | score: {current}→{new_score} | status: {old_status}→{new_status}")
 
 def is_port_cooling(port):
     with port_health_lock:
@@ -300,22 +335,54 @@ def send_newnym(port):
     try:
         port_idx = port - global_base_port
         if port_idx < 0:
+            logger.error(f"[NEWNYM]  port:{port} | invalid port index (port_idx={port_idx})")
             return
         container_idx = port_idx // PORTS_PER_CONTAINER
         tor_idx = port_idx % PORTS_PER_CONTAINER
         container_name = f"{CONTAINER_PREFIX}{container_idx}"
         control_port = 9150 + tor_idx
+        logger.info(f"[NEWNYM]  port:{port} | container:{container_name} | control_port:{control_port} | sending SIGNAL NEWNYM")
+
+        # Primary method: docker exec + nc
         cmd = (
             f'docker exec {container_name} sh -c '
             f'"printf \'AUTHENTICATE\\r\\nSIGNAL NEWNYM\\r\\nQUIT\\r\\n\' '
             f'| nc 127.0.0.1 {control_port} -w 3"'
         )
-        success, _ = run_cmd(cmd)
+        success, output = run_cmd(cmd)
         if success:
             with lock:
                 total_newnyms += 1
-    except:
-        pass
+            with port_health_lock:
+                port_health_scores[port] = PORT_HEALTH_NEWNYM_RESET
+                port_cooling_until[port] = 0  # clear cooling
+            logger.info(f"[NEWNYM]  port:{port} | sent SIGNAL NEWNYM via docker exec | health reset to {PORT_HEALTH_NEWNYM_RESET}")
+            return
+
+        logger.warning(f"[NEWNYM]  port:{port} | docker exec failed (output: {output!r}), trying socket fallback")
+
+        # Fallback method: Python socket directly to Tor control port
+        try:
+            with socket.create_connection(("127.0.0.1", control_port), timeout=5) as sock:
+                sock.sendall(b"AUTHENTICATE\r\nSIGNAL NEWNYM\r\nQUIT\r\n")
+                resp = sock.recv(1024).decode(errors="replace")
+            if "250" in resp:
+                with lock:
+                    total_newnyms += 1
+                with port_health_lock:
+                    port_health_scores[port] = PORT_HEALTH_NEWNYM_RESET
+                    port_cooling_until[port] = 0
+                logger.info(f"[NEWNYM]  port:{port} | sent SIGNAL NEWNYM via socket | health reset to {PORT_HEALTH_NEWNYM_RESET}")
+            else:
+                logger.error(f"[NEWNYM]  port:{port} | socket fallback unexpected response: {resp!r}")
+        except ConnectionRefusedError:
+            logger.error(f"[NEWNYM]  port:{port} | socket fallback: connection refused on control_port:{control_port}")
+        except socket.timeout:
+            logger.error(f"[NEWNYM]  port:{port} | socket fallback: timeout connecting to control_port:{control_port}")
+        except Exception as exc:
+            logger.error(f"[NEWNYM]  port:{port} | socket fallback error: {exc}")
+    except Exception as exc:
+        logger.error(f"[NEWNYM]  port:{port} | unexpected error: {exc}")
 
 
 # ── Port health manager (background daemon) ───────────────────────────────────
@@ -331,14 +398,24 @@ def port_health_manager():
         dead_ports = []
         with port_health_lock:
             for port, health in list(port_health_scores.items()):
-                # Passive recovery: ports not in cooling slowly regain health
-                if port_cooling_until.get(port, 0) < now and health < PORT_HEALTH_INITIAL:
+                in_cooling = port_cooling_until.get(port, 0) >= now
+                if in_cooling:
+                    # Time-based recovery: cooling ports slowly regain health every 60s
+                    new_health = min(PORT_HEALTH_INITIAL, health + PORT_HEALTH_COOLING_RECOVERY)
+                    if new_health != health:
+                        port_health_scores[port] = new_health
+                        logger.debug(f"[HEALTH]  port:{port} | cooling recovery: {health}→{new_health}")
+                elif health < PORT_HEALTH_INITIAL:
+                    # Normal passive recovery when not in cooling
                     port_health_scores[port] = min(PORT_HEALTH_INITIAL, health + 2)
-                # Dead port: send NEWNYM and reset to mid-health
-                if health < PORT_HEALTH_DEAD_THRESHOLD and port_cooling_until.get(port, 0) < now:
+
+                # Dead port: send NEWNYM and reset health
+                current_health = port_health_scores[port]
+                if current_health <= PORT_HEALTH_DEAD_THRESHOLD and port_cooling_until.get(port, 0) < now:
                     port_cooling_until[port] = now + PORT_DEAD_DURATION
-                    port_health_scores[port] = 50
                     dead_ports.append(port)
+                    logger.warning(f"[HEALTH]  port:{port} | score: {current_health} | status: DEAD | triggering NEWNYM")
+
         for port in dead_ports:
             Thread(target=send_newnym, args=(port,), daemon=True).start()
 
@@ -474,25 +551,57 @@ def get_viewer_count_for(streamer):
 # ── Token fetching ────────────────────────────────────────────────────────────
 def fetch_token(port=None):
     try:
-        s = tls_client.Session(client_identifier=get_random_tls_id(), random_tls_extension_order=True)
-        if all_ports:
-            s.proxies = get_proxy_dict(port)
-        s.headers.update({
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'User-Agent': get_random_ua(),
-        })
-        s.get("https://kick.com", timeout_seconds=20)
+        now = time.time()
+        session_key = port if port else 0
+        s = None
+
+        # Session cache: reuse existing session if less than SESSION_CACHE_TTL old
+        with session_cache_lock:
+            cached = SESSION_CACHE.get(session_key)
+            if cached:
+                s_obj, last_used = cached
+                if now - last_used < SESSION_CACHE_TTL:
+                    s = s_obj
+                else:
+                    del SESSION_CACHE[session_key]
+
+        if s is None:
+            s = tls_client.Session(client_identifier=get_random_tls_id(), random_tls_extension_order=True)
+            if all_ports:
+                s.proxies = get_proxy_dict(port)
+            s.headers.update({
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'User-Agent': get_random_ua(),
+            })
+            s.get("https://kick.com", timeout_seconds=20)
+            with session_cache_lock:
+                SESSION_CACHE[session_key] = (s, now)
+
         s.headers["X-CLIENT-TOKEN"] = CLIENT_TOKEN
         response = s.get('https://websockets.kick.com/viewer/v1/token', timeout_seconds=20)
         if response.status_code == 200:
             data = response.json()
-            return data.get("data", {}).get("token")
+            token = data.get("data", {}).get("token")
+            if token:
+                logger.debug(f"[TOKEN]   port:{port} | fetched token | pool: {token_queue.qsize()}")
+                # Update session last used time
+                with session_cache_lock:
+                    SESSION_CACHE[session_key] = (s, time.time())
+                return token
         elif response.status_code == 403:
             if port:
                 blacklist_port(port)
                 update_port_health(port, -PORT_HEALTH_403_PENALTY)
-    except:
-        pass
+            # Invalidate cached session on 403
+            with session_cache_lock:
+                SESSION_CACHE.pop(session_key, None)
+            logger.warning(f"[TOKEN]   port:{port} | 403 Forbidden | health penalized -{PORT_HEALTH_403_PENALTY}")
+        else:
+            logger.warning(f"[TOKEN]   port:{port} | HTTP {response.status_code}")
+    except Exception as exc:
+        logger.debug(f"[TOKEN]   port:{port} | error: {exc}")
+        with session_cache_lock:
+            SESSION_CACHE.pop(session_key, None)
     return None
 
 
@@ -531,8 +640,9 @@ def get_token_from_pool():
     while True:
         try:
             token, port, ts = token_queue.get(timeout=0.1)
-            if now - ts > TOKEN_MAX_AGE_SECONDS:
-                # Stale token — discard and try next
+            age = now - ts
+            if age > TOKEN_MAX_AGE_SECONDS:
+                logger.debug(f"[TOKEN]   port:{port} | stale token discarded | age: {age:.0f}s | pool: {token_queue.qsize()}")
                 continue
             with lock:
                 token_hits += 1
@@ -555,9 +665,13 @@ def get_standby_token(streamer):
         try:
             item = streamer.standby_tokens.get_nowait()
             token, port, ts = item
-            if now - ts < STANDBY_TTL and not is_port_cooling(port):
+            age = now - ts
+            if age < STANDBY_TTL and not is_port_cooling(port):
+                pool_size = streamer.standby_tokens.qsize()
+                logger.debug(f"[STANDBY] [{streamer.name}] consumed token from port:{port} | age: {age:.0f}s | standby_pool: {pool_size}/{STANDBY_MAX_PER_STREAMER}")
                 return item
             # Stale or port in cooling — discard
+            logger.debug(f"[STANDBY] [{streamer.name}] discarded stale/cooling token from port:{port} | age: {age:.0f}s")
         except Empty:
             return None
 
@@ -578,8 +692,11 @@ def standby_producer(streamer):
                     if token:
                         update_port_health(port, PORT_HEALTH_SUCCESS_BONUS)
                         streamer.standby_tokens.put((token, port, time.time()))
+                        pool_size = streamer.standby_tokens.qsize()
+                        logger.info(f"[STANDBY] [{streamer.name}] produced token on port:{port} | standby_pool: {pool_size}/{STANDBY_MAX_PER_STREAMER}")
                     else:
                         update_port_health(port, -PORT_HEALTH_FAIL_PENALTY)
+                        time.sleep(STANDBY_PRODUCTION_RETRY_DELAY)
                 else:
                     time.sleep(5)
             else:
@@ -616,6 +733,7 @@ def show_stats():
     n = 4 + len(streamers)
     print("\n" * n)
     os.system('cls' if os.name == 'nt' else 'clear')
+    last_log_time = 0
     while not stop:
         try:
             for s in streamers:
@@ -659,6 +777,24 @@ def show_stats():
             for line in lines:
                 print(line)
             sys.stdout.flush()
+
+            # Periodic summary log every 30 seconds
+            if now - last_log_time >= 30:
+                total_conn = sum(s.connections for s in streamers if s.active)
+                logger.info(
+                    f"[STATE]   periodic stats | port_health: {healthy_ports}/{len(all_ports)} good"
+                    f" | token_pool: {token_queue.qsize()} | streamers: {len(streamers)} | total_conn: {total_conn}"
+                    f" | newnyms: {total_newnyms}"
+                )
+                for s in streamers:
+                    if s.active:
+                        logger.info(
+                            f"[STATE]   [{s.name}] conn: {s.connections}/{s.target_viewers}"
+                            f" | standby: {s.standby_tokens.qsize()}/{STANDBY_MAX_PER_STREAMER}"
+                            f" | errors: {s.ws_errors} | viewers: {s.viewers}"
+                        )
+                last_log_time = now
+
             time.sleep(1)
         except:
             time.sleep(1)
@@ -687,6 +823,7 @@ async def ws_handler(session, token, streamer, port, connect_timeout=30.0):
             streamer.connections += 1
             streamer.pending_connections = max(0, streamer.pending_connections - 1)
         connected = True
+        logger.debug(f"[WS_CONN] [{streamer.name}] port:{port} | connected | conn: {streamer.connections}/{streamer.target_viewers}")
 
         subscribe = {"event": "pusher:subscribe", "data": {"auth": "", "channel": f"channel.{streamer.channel_id}"}}
         await ws.send_str(json.dumps(subscribe))
@@ -719,6 +856,7 @@ async def ws_handler(session, token, streamer, port, connect_timeout=30.0):
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         last_activity = time.time()
                     elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        logger.debug(f"[WS_DROP] [{streamer.name}] port:{port} | reason: {msg.type.name}")
                         break
                 except asyncio.TimeoutError:
                     pass
@@ -726,8 +864,10 @@ async def ws_handler(session, token, streamer, port, connect_timeout=30.0):
                 if time.time() - last_activity > PONG_TIMEOUT:
                     # Layer 2: timeout → penalise port health
                     update_port_health(port, -PORT_HEALTH_TIMEOUT_PENALTY)
+                    logger.debug(f"[WS_DROP] [{streamer.name}] port:{port} | reason: PongTimeout ({PONG_TIMEOUT}s)")
                     break
-            except:
+            except Exception as inner_exc:
+                logger.debug(f"[WS_DROP] [{streamer.name}] port:{port} | reason: {inner_exc}")
                 break
     except asyncio.TimeoutError:
         # Layer 5: activation verification failed (2s timeout on standby tokens)
@@ -735,13 +875,16 @@ async def ws_handler(session, token, streamer, port, connect_timeout=30.0):
         with lock:
             streamer.ws_errors += 1
             streamer.pending_connections = max(0, streamer.pending_connections - 1)
+        logger.debug(f"[WS_DROP] [{streamer.name}] port:{port} | reason: ConnectTimeout ({connect_timeout}s)")
     except Exception as e:
         err_str = str(e)
         if '403' in err_str:
             update_port_health(port, -PORT_HEALTH_403_PENALTY)
             blacklist_port(port)
+            logger.warning(f"[ERROR]   [{streamer.name}] port:{port} | 403 Forbidden | health: -{PORT_HEALTH_403_PENALTY} | action: cooling")
         else:
             update_port_health(port, -PORT_HEALTH_FAIL_PENALTY)
+            logger.debug(f"[ERROR]   [{streamer.name}] port:{port} | {err_str[:120]}")
         with lock:
             streamer.ws_errors += 1
             streamer.pending_connections = max(0, streamer.pending_connections - 1)
@@ -796,13 +939,21 @@ async def run_port_pool(port, streamer_list):
                     streamer_tasks = {t for t in streamer_tasks if not t.done()}
                     active_tasks[streamer.name] = streamer_tasks
 
+                    # Dynamic clients per port: ceil(target / available_ports), capped by hard limit
+                    available_ports = max(1, len([p for p in all_ports if not is_port_cooling(p)]))
+                    dynamic_max = min(
+                        MAX_CLIENTS_PER_PORT_HARD_LIMIT,
+                        max(2, math.ceil(streamer.target_viewers / available_ports))
+                    )
+
                     # Atomic reservation under lock
                     reserved = 0
                     with lock:
                         claimed = streamer.connections + streamer.pending_connections
                         available = streamer.target_viewers - claimed
                         if available > 0:
-                            to_send = max(0, min(available, 1) - len(streamer_tasks))
+                            can_add = max(0, dynamic_max - len(streamer_tasks))
+                            to_send = min(available, can_add)
                             if to_send > 0:
                                 streamer.pending_connections += to_send
                                 reserved = to_send
