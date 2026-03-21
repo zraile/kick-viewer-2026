@@ -60,13 +60,13 @@ MAX_SPAWN_DELAY = 2.0
 MIN_RECONNECT_DELAY = 1
 MAX_RECONNECT_DELAY = 5
 
-# Gradual ramp-up: list of (threshold_seconds, fraction_of_target)
-RAMP_STAGES = [
-    (30, 0.25),
-    (60, 0.50),
-    (120, 0.75),
-]
-RAMP_FULL_FRACTION = 1.0
+# Ramp-up disabled for shared-port mode (port başına 1-2 client için anlamsız)
+# RAMP_STAGES = [
+#     (30, 0.25),
+#     (60, 0.50),
+#     (120, 0.75),
+# ]
+# RAMP_FULL_FRACTION = 1.0
 
 # 15+ realistic User-Agent strings for rotation
 USER_AGENTS = [
@@ -539,36 +539,37 @@ async def run_port_pool(port, streamer_list):
                 if all(s.is_expired() for s in streamer_list if s.active):
                     break
 
+                # Token pool check — döngü dışında, tüm yayıncılar için
+                pool_size = token_queue.qsize()
+                if pool_size < 10:
+                    await asyncio.sleep(1.0)
+                    continue
+
+                spawned_any = False
                 for streamer in streamer_list:
+                    if stop:
+                        break
                     if not streamer.active or streamer.is_expired():
                         continue
+                    if not streamer.channel_id:
+                        continue
 
+                    # Bu porttan bu yayıncıya kaç client gidecek
                     total_ports = len(all_ports) if all_ports else 1
                     clients_from_this_port = max(1, math.ceil(streamer.target_viewers / total_ports))
-                    ramp_target = get_ramp_target(streamer, clients_from_this_port)
 
+                    # Aktif taskları temizle
                     streamer_tasks = active_tasks.get(streamer.name, set())
-                    done_tasks = {t for t in streamer_tasks if t.done()}
-                    streamer_tasks -= done_tasks
+                    streamer_tasks = {t for t in streamer_tasks if not t.done()}
                     active_tasks[streamer.name] = streamer_tasks
 
-                    slots = ramp_target - len(streamer_tasks)
+                    # Kaç slot açık?
+                    slots = clients_from_this_port - len(streamer_tasks)
                     if slots <= 0:
                         continue
 
-                    pool_size = token_queue.qsize()
-                    if pool_size < 20:
-                        await asyncio.sleep(0.5)
-                        continue
-
-                    batch_size = (
-                        min(slots, 10) if pool_size > 100 else
-                        min(slots, 5) if pool_size > 30 else
-                        min(slots, 2)
-                    )
-
-                    done_count = len(done_tasks)
-                    for _ in range(batch_size):
+                    # Token al ve bağlantı aç
+                    for _ in range(slots):
                         if stop or streamer.is_expired():
                             break
                         token, _ = get_token_from_pool()
@@ -579,12 +580,16 @@ async def run_port_pool(port, streamer_list):
                         task = asyncio.create_task(ws_handler(session, token, streamer))
                         streamer_tasks.add(task)
                         active_tasks[streamer.name] = streamer_tasks
-                        await asyncio.sleep(random.uniform(MIN_SPAWN_DELAY, MAX_SPAWN_DELAY))
+                        spawned_any = True
+                        # Spawn delay sadece birden fazla client açılacaksa
+                        if slots > 1:
+                            await asyncio.sleep(random.uniform(MIN_SPAWN_DELAY, MAX_SPAWN_DELAY))
 
-                    if done_count:
-                        await asyncio.sleep(random.uniform(MIN_RECONNECT_DELAY, MAX_RECONNECT_DELAY))
-
-                await asyncio.sleep(0.3)
+                # Ana döngü bekleme süresi
+                if spawned_any:
+                    await asyncio.sleep(random.uniform(0.5, 1.5))
+                else:
+                    await asyncio.sleep(2.0)
     except:
         pass
 
