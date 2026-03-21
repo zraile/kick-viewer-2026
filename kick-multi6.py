@@ -554,23 +554,27 @@ async def run_port_pool(port, streamer_list):
                     if not streamer.channel_id:
                         continue
 
-                    # Bu porttan bu yayıncıya kaç client gidecek
-                    total_ports = len(all_ports) if all_ports else 1
-                    clients_from_this_port = max(1, math.ceil(streamer.target_viewers / total_ports))
+                    # Global bağlantı kontrolü: hedef dolmuşsa bu yayıncıyı atla
+                    global_slots = streamer.target_viewers - streamer.connections
+                    if global_slots <= 0:
+                        continue
 
                     # Aktif taskları temizle
                     streamer_tasks = active_tasks.get(streamer.name, set())
                     streamer_tasks = {t for t in streamer_tasks if not t.done()}
                     active_tasks[streamer.name] = streamer_tasks
 
-                    # Kaç slot açık?
-                    slots = clients_from_this_port - len(streamer_tasks)
-                    if slots <= 0:
+                    # Bu port'tan en fazla 2 client gönder (tüm portlar paralel çalışıyor)
+                    local_slots = min(global_slots, 2) - len(streamer_tasks)
+                    if local_slots <= 0:
                         continue
 
                     # Token al ve bağlantı aç
-                    for _ in range(slots):
+                    for _ in range(local_slots):
                         if stop or streamer.is_expired():
+                            break
+                        # Başka portlardan gelen bağlantılar hedefi doldurmuş olabilir
+                        if streamer.connections >= streamer.target_viewers:
                             break
                         token, _ = get_token_from_pool()
                         if not token:
@@ -582,7 +586,7 @@ async def run_port_pool(port, streamer_list):
                         active_tasks[streamer.name] = streamer_tasks
                         spawned_any = True
                         # Spawn delay sadece birden fazla client açılacaksa
-                        if slots > 1:
+                        if local_slots > 1:
                             await asyncio.sleep(random.uniform(MIN_SPAWN_DELAY, MAX_SPAWN_DELAY))
 
                 # Ana döngü bekleme süresi
