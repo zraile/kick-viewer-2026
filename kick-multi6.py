@@ -26,14 +26,14 @@ CLIENT_TOKEN = "e1393935a959b4020a4491574f6490129f678acdaa92760471263db43487f823
 DOCKER_IMAGE = "multitor:latest"
 CONTAINER_PREFIX = "multitor_"
 PORTS_PER_CONTAINER = 6
-CONNS_PER_PORT = 80
+CONNS_PER_PORT = 120
 BASE_TOKEN_POOL_SIZE = 500
 BASE_INITIAL_POOL_WAIT = 150
 BASE_TOKEN_PRODUCERS = 60
 TOKEN_POOL_SIZE = 500
 INITIAL_POOL_WAIT = 150
 TOKEN_PRODUCERS = 60
-PONG_TIMEOUT = 90  # Reduced from 180s to drop dead connections faster and free slots sooner
+PONG_TIMEOUT = 180
 STATE_FILE = "state.json"
 LIST_FILE = "liste.txt"
 
@@ -41,7 +41,7 @@ LIST_FILE = "liste.txt"
 TOKEN_SCALE_VIEWERS = 50
 
 # Port blacklist duration (seconds) when a 403 is received
-PORT_BLACKLIST_DURATION = 180
+PORT_BLACKLIST_DURATION = 120
 
 # Token producer backoff settings
 BACKOFF_FAILURE_THRESHOLD = 5
@@ -53,27 +53,18 @@ MIN_PING_INTERVAL = 15
 MAX_PING_INTERVAL = 25
 
 # Client spawn delay range (seconds) — anti-block
-MIN_SPAWN_DELAY = 1.5
-MAX_SPAWN_DELAY = 4.0
+MIN_SPAWN_DELAY = 0.5
+MAX_SPAWN_DELAY = 2.0
 
 # Auto-reconnect delay range (seconds)
-MIN_RECONNECT_DELAY = 3
-MAX_RECONNECT_DELAY = 8
-
-# Per-batch cooldown added after each spawn batch in run_port_pool (seconds)
-MIN_BATCH_COOLDOWN = 0.5
-MAX_BATCH_COOLDOWN = 1.5
-
-# Backoff delay before recording a ws error (seconds) — prevents failure cascade
-MIN_ERROR_BACKOFF = 1.0
-MAX_ERROR_BACKOFF = 3.0
+MIN_RECONNECT_DELAY = 1
+MAX_RECONNECT_DELAY = 5
 
 # Gradual ramp-up: list of (threshold_seconds, fraction_of_target)
 RAMP_STAGES = [
-    (60, 0.20),
-    (120, 0.40),
-    (180, 0.60),
-    (240, 0.80),
+    (30, 0.25),
+    (60, 0.50),
+    (120, 0.75),
 ]
 RAMP_FULL_FRACTION = 1.0
 
@@ -515,7 +506,6 @@ async def ws_handler(session, token, streamer):
             except:
                 break
     except:
-        await asyncio.sleep(random.uniform(MIN_ERROR_BACKOFF, MAX_ERROR_BACKOFF))
         with lock:
             streamer.ws_errors += 1
     finally:
@@ -529,72 +519,81 @@ async def ws_handler(session, token, streamer):
                 streamer.connections = max(0, streamer.connections - 1)
 
 
-# --- Port pool runner (per streamer per port) ---
-async def run_port_pool(port, target_count, streamer):
+# --- Port pool runner (per port, serves all streamers) ---
+async def run_port_pool(port, streamer_list):
     global stop
     try:
         connector = ProxyConnector.from_url(
             f'socks5://127.0.0.1:{port}',
-            limit=target_count,
-            limit_per_host=target_count,
+            limit=CONNS_PER_PORT,
+            limit_per_host=CONNS_PER_PORT,
         )
     except:
         return
 
     try:
         async with aiohttp.ClientSession(connector=connector) as session:
-            active_tasks = set()
+            active_tasks = {}  # {streamer_name: set of tasks}
 
-            while not stop and not streamer.is_expired():
-                done = {t for t in active_tasks if t.done()}
-                active_tasks -= done
+            while not stop:
+                if all(s.is_expired() for s in streamer_list if s.active):
+                    break
 
-                ramp_target = get_ramp_target(streamer, target_count)
-                slots = ramp_target - len(active_tasks)
-                pool_size = token_queue.qsize()
+                for streamer in streamer_list:
+                    if not streamer.active or streamer.is_expired():
+                        continue
 
-                if pool_size < 50:
-                    await asyncio.sleep(1.0)
-                    continue
+                    total_ports = len(all_ports) if all_ports else 1
+                    clients_from_this_port = max(1, math.ceil(streamer.target_viewers / total_ports))
+                    ramp_target = get_ramp_target(streamer, clients_from_this_port)
 
-                if slots <= 0:
-                    await asyncio.sleep(0.3)
-                    continue
+                    streamer_tasks = active_tasks.get(streamer.name, set())
+                    done_tasks = {t for t in streamer_tasks if t.done()}
+                    streamer_tasks -= done_tasks
+                    active_tasks[streamer.name] = streamer_tasks
 
-                batch_size = (
-                    min(slots, 4) if pool_size > 200 else
-                    min(slots, 2) if pool_size > 50 else
-                    min(slots, 1)
-                )
+                    slots = ramp_target - len(streamer_tasks)
+                    if slots <= 0:
+                        continue
 
-                for _ in range(batch_size):
-                    if stop or streamer.is_expired():
-                        break
-                    token, _ = get_token_from_pool()
-                    if not token:
-                        break
-                    with lock:
-                        streamer.attempts += 1
-                    task = asyncio.create_task(ws_handler(session, token, streamer))
-                    active_tasks.add(task)
-                    await asyncio.sleep(random.uniform(MIN_SPAWN_DELAY, MAX_SPAWN_DELAY))
+                    pool_size = token_queue.qsize()
+                    if pool_size < 20:
+                        await asyncio.sleep(0.5)
+                        continue
 
-                await asyncio.sleep(random.uniform(MIN_BATCH_COOLDOWN, MAX_BATCH_COOLDOWN))
+                    batch_size = (
+                        min(slots, 10) if pool_size > 100 else
+                        min(slots, 5) if pool_size > 30 else
+                        min(slots, 2)
+                    )
 
-                # Reconnect faster when connections dropped
-                if done:
-                    await asyncio.sleep(random.uniform(MIN_RECONNECT_DELAY, MAX_RECONNECT_DELAY))
-                else:
-                    await asyncio.sleep(0.3)
+                    done_count = len(done_tasks)
+                    for _ in range(batch_size):
+                        if stop or streamer.is_expired():
+                            break
+                        token, _ = get_token_from_pool()
+                        if not token:
+                            break
+                        with lock:
+                            streamer.attempts += 1
+                        task = asyncio.create_task(ws_handler(session, token, streamer))
+                        streamer_tasks.add(task)
+                        active_tasks[streamer.name] = streamer_tasks
+                        await asyncio.sleep(random.uniform(MIN_SPAWN_DELAY, MAX_SPAWN_DELAY))
+
+                    if done_count:
+                        await asyncio.sleep(random.uniform(MIN_RECONNECT_DELAY, MAX_RECONNECT_DELAY))
+
+                await asyncio.sleep(0.3)
     except:
         pass
 
 
-def port_worker(port, count, streamer):
+def port_worker(port, streamer_list):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(run_port_pool(port, count, streamer))
+        loop.run_until_complete(run_port_pool(port, streamer_list))
     except:
         pass
     finally:
@@ -617,20 +616,13 @@ def run_all_streamers():
     Thread(target=show_stats, daemon=True).start()
 
     threads = []
-    for s in streamers:
-        if not s.active:
-            continue
-        ports = s.assigned_ports
-        if not ports:
-            continue
-        conns_per_port = max(1, min(CONNS_PER_PORT, math.ceil(s.target_viewers / len(ports))))
-        for port in ports:
-            if stop:
-                break
-            t = Thread(target=port_worker, args=(port, conns_per_port, s), daemon=True)
-            threads.append(t)
-            t.start()
-            time.sleep(0.02)
+    for port in all_ports:
+        if stop:
+            break
+        t = Thread(target=port_worker, args=(port, streamers), daemon=True)
+        threads.append(t)
+        t.start()
+        time.sleep(0.02)
 
     while not stop:
         if all(s.is_expired() for s in streamers if s.active):
@@ -755,9 +747,6 @@ if __name__ == "__main__":
             get_channel_info_for(s)
             if s.channel_id:
                 print(f"[+] {s.name}: Channel ID={s.channel_id} | Stream ID={s.stream_id or 'N/A'}")
-
-        # Assign ports proportionally
-        assign_ports(streamers, all_ports)
 
         # Start token producers
         print("[*] Starting token producers...")
