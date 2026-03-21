@@ -1,5 +1,16 @@
-# Her satıra bir yayıncı adı veya kick.com linki yazın
-# Boş satırlar ve # ile başlayan satırlar yoksayılır
-# Örnekler:
+# ── liste.txt — Yayıncı Listesi ───────────────────────────────────────────────
+# Her satıra bir yayıncı adı veya kick.com linki yazın.
+# Boş satırlar ve # ile başlayan satırlar otomatik olarak yoksayılır.
+#
+# Desteklenen formatlar:
+#   yayinciad          → kick.com kullanıcı adı
+#   https://kick.com/yayinciad  → tam link
+#
+# Örnek kullanım:
 # streamer1
-# https://kick.com/streamer2
+# streamer2
+# https://kick.com/streamer3
+#
+# Not: Büyük/küçük harf farkı yoktur; bot otomatik olarak küçük harfe çevirir.
+# state.json dosyasına kaydedilen yayıncılar program yeniden başlatılınca
+# kalan süreleriyle otomatik devam eder.

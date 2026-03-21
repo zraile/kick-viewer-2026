@@ -1,2 +1,4 @@
 SocksPort 0.0.0.0:PORT
+ControlPort 127.0.0.1:CPORT
+CookieAuthentication 0
 DataDirectory /var/lib/tor/dataIDX
