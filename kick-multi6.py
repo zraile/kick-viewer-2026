@@ -1,3 +1,5 @@
+VERSION = "2.0.0"
+
 import sys
 import time
 import math
@@ -22,6 +24,7 @@ try:
 except ImportError:
     FULL_SUPPORT = False
 
+# ── Core settings ─────────────────────────────────────────────────────────────
 CLIENT_TOKEN = "e1393935a959b4020a4491574f6490129f678acdaa92760471263db43487f823"
 DOCKER_IMAGE = "multitor:latest"
 CONTAINER_PREFIX = "multitor_"
@@ -60,15 +63,42 @@ MAX_SPAWN_DELAY = 2.0
 MIN_RECONNECT_DELAY = 1
 MAX_RECONNECT_DELAY = 5
 
-# Ramp-up disabled for shared-port mode (port başına 1-2 client için anlamsız)
-# RAMP_STAGES = [
-#     (30, 0.25),
-#     (60, 0.50),
-#     (120, 0.75),
-# ]
-# RAMP_FULL_FRACTION = 1.0
+# ── v2.0.0 constants ──────────────────────────────────────────────────────────
 
-# 15+ realistic User-Agent strings for rotation
+# Standby pool
+STANDBY_MAX_PER_STREAMER = 10
+STANDBY_FILL_MIN_POOL = 50       # produce standby only when main pool has this many tokens
+STANDBY_TTL = 90                 # max age (seconds) for a standby token
+
+# Token freshness
+TOKEN_MAX_AGE_SECONDS = 300      # tokens older than this are discarded from main pool
+
+# Port health score system (0-100)
+PORT_HEALTH_INITIAL = 100
+PORT_HEALTH_SUCCESS_BONUS = 5
+PORT_HEALTH_FAIL_PENALTY = 15
+PORT_HEALTH_403_PENALTY = 30
+PORT_HEALTH_TIMEOUT_PENALTY = 10
+PORT_HEALTH_STANDBY_THRESHOLD = 70   # min health to produce standby tokens
+PORT_HEALTH_COOLING_THRESHOLD = 30   # below this → cooling mode
+PORT_HEALTH_DEAD_THRESHOLD = 10      # below this → dead (longer cooling + NEWNYM)
+
+PORT_COOLING_DURATION = 300          # seconds for cooling mode
+PORT_DEAD_DURATION = 600             # seconds for dead mode
+
+# Periodic save interval
+PERIODIC_SAVE_INTERVAL = 300         # every 5 minutes
+
+# TLS fingerprint pool for rotation
+TLS_CLIENT_IDENTIFIERS = [
+    "chrome_119",
+    "chrome_120",
+    "chrome_121",
+    "safari_17_2",
+    "firefox_120",
+]
+
+# ── User-Agents ───────────────────────────────────────────────────────────────
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
@@ -92,20 +122,29 @@ USER_AGENTS = [
 def get_random_ua():
     return random.choice(USER_AGENTS)
 
-# --- Globals ---
+def get_random_tls_id():
+    return random.choice(TLS_CLIENT_IDENTIFIERS)
+
+
+# ── Globals ───────────────────────────────────────────────────────────────────
 stop = False
 lock = threading.Lock()
 token_queue = Queue()
 token_hits = 0
 token_misses = 0
+total_newnyms = 0
 containers = []
 all_ports = []
 port_blacklist = {}
 port_blacklist_lock = threading.Lock()
+port_health_scores = {}
+port_health_lock = threading.Lock()
+port_cooling_until = {}
+global_base_port = 19050
 streamers = []
 
 
-# --- StreamerInfo class ---
+# ── StreamerInfo class ────────────────────────────────────────────────────────
 class StreamerInfo:
     def __init__(self, name, target_viewers, duration_seconds, start_time=None):
         self.name = name
@@ -124,6 +163,7 @@ class StreamerInfo:
         self.pending_connections = 0
         self.active = True
         self.assigned_ports = []
+        self.standby_tokens = Queue()   # pre-fetched (token, port, timestamp) tuples
 
     def total_claimed(self):
         return self.connections + self.pending_connections
@@ -148,7 +188,7 @@ class StreamerInfo:
         return f"{hours:02d}:{mins:02d}:{s:02d}"
 
 
-# --- Token pool settings ---
+# ── Token pool settings ───────────────────────────────────────────────────────
 def calculate_token_settings(total_target_viewers):
     global TOKEN_POOL_SIZE, INITIAL_POOL_WAIT, TOKEN_PRODUCERS
     scale = max(1, math.ceil(total_target_viewers / TOKEN_SCALE_VIEWERS))
@@ -157,7 +197,7 @@ def calculate_token_settings(total_target_viewers):
     TOKEN_PRODUCERS = BASE_TOKEN_PRODUCERS + (scale - 1) * 5
 
 
-# --- Docker helpers ---
+# ── Docker helpers ────────────────────────────────────────────────────────────
 def run_cmd(cmd):
     try:
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
@@ -190,14 +230,58 @@ def cleanup_containers():
         run_cmd(f"docker rm -f {name}")
 
 
-# --- Port management ---
+# ── Port health management ────────────────────────────────────────────────────
+def get_port_health(port):
+    with port_health_lock:
+        return port_health_scores.get(port, PORT_HEALTH_INITIAL)
+
+def update_port_health(port, delta):
+    """Update health score for a port and apply cooling if needed."""
+    with port_health_lock:
+        current = port_health_scores.get(port, PORT_HEALTH_INITIAL)
+        new_score = max(0, min(100, current + delta))
+        port_health_scores[port] = new_score
+        if delta < 0 and new_score < PORT_HEALTH_COOLING_THRESHOLD:
+            now = time.time()
+            # Only set cooling if not already cooling (avoid repeated extension)
+            if port_cooling_until.get(port, 0) < now:
+                duration = PORT_DEAD_DURATION if new_score < PORT_HEALTH_DEAD_THRESHOLD else PORT_COOLING_DURATION
+                port_cooling_until[port] = now + duration
+
+def is_port_cooling(port):
+    with port_health_lock:
+        return port_cooling_until.get(port, 0) >= time.time()
+
+def get_random_healthy_port(port_pool=None):
+    """Return a random port that is not blacklisted and not in cooling."""
+    pool = port_pool if port_pool else all_ports
+    if not pool:
+        return None
+    now = time.time()
+    with port_health_lock:
+        with port_blacklist_lock:
+            available = [
+                p for p in pool
+                if port_cooling_until.get(p, 0) < now
+                and port_blacklist.get(p, 0) < now
+                and port_health_scores.get(p, PORT_HEALTH_INITIAL) >= PORT_HEALTH_COOLING_THRESHOLD
+            ]
+    return random.choice(available) if available else None
+
+
+# ── Port management ───────────────────────────────────────────────────────────
 def get_random_port(port_pool=None):
     pool = port_pool if port_pool else all_ports
     if not pool:
         return 9050
     now = time.time()
-    with port_blacklist_lock:
-        available = [p for p in pool if port_blacklist.get(p, 0) < now]
+    with port_health_lock:
+        with port_blacklist_lock:
+            available = [
+                p for p in pool
+                if port_blacklist.get(p, 0) < now
+                and port_cooling_until.get(p, 0) < now
+            ]
     return random.choice(available) if available else random.choice(pool)
 
 def blacklist_port(port, duration=PORT_BLACKLIST_DURATION):
@@ -209,7 +293,57 @@ def get_proxy_dict(port=None, port_pool=None):
     return {"http": f"socks5://127.0.0.1:{p}", "https": f"socks5://127.0.0.1:{p}"}
 
 
-# --- Channel name cleaning ---
+# ── Tor circuit renewal (NEWNYM) ──────────────────────────────────────────────
+def send_newnym(port):
+    """Send SIGNAL NEWNYM to the Tor control port for a given SOCKS port."""
+    global total_newnyms
+    try:
+        port_idx = port - global_base_port
+        if port_idx < 0:
+            return
+        container_idx = port_idx // PORTS_PER_CONTAINER
+        tor_idx = port_idx % PORTS_PER_CONTAINER
+        container_name = f"{CONTAINER_PREFIX}{container_idx}"
+        control_port = 9150 + tor_idx
+        cmd = (
+            f'docker exec {container_name} sh -c '
+            f'"printf \'AUTHENTICATE\\r\\nSIGNAL NEWNYM\\r\\nQUIT\\r\\n\' '
+            f'| nc 127.0.0.1 {control_port} -w 3"'
+        )
+        success, _ = run_cmd(cmd)
+        if success:
+            with lock:
+                total_newnyms += 1
+    except:
+        pass
+
+
+# ── Port health manager (background daemon) ───────────────────────────────────
+def port_health_manager():
+    """
+    Layer 4: Monitors port health scores, triggers Tor NEWNYM for dead ports,
+    and passively restores health for recovering ports.
+    """
+    global stop
+    while not stop:
+        time.sleep(60)
+        now = time.time()
+        dead_ports = []
+        with port_health_lock:
+            for port, health in list(port_health_scores.items()):
+                # Passive recovery: ports not in cooling slowly regain health
+                if port_cooling_until.get(port, 0) < now and health < PORT_HEALTH_INITIAL:
+                    port_health_scores[port] = min(PORT_HEALTH_INITIAL, health + 2)
+                # Dead port: send NEWNYM and reset to mid-health
+                if health < PORT_HEALTH_DEAD_THRESHOLD and port_cooling_until.get(port, 0) < now:
+                    port_cooling_until[port] = now + PORT_DEAD_DURATION
+                    port_health_scores[port] = 50
+                    dead_ports.append(port)
+        for port in dead_ports:
+            Thread(target=send_newnym, args=(port,), daemon=True).start()
+
+
+# ── Channel name cleaning ─────────────────────────────────────────────────────
 def clean_channel_name(name):
     if "kick.com/" in name:
         parts = name.split("kick.com/")
@@ -218,7 +352,7 @@ def clean_channel_name(name):
     return name.lower()
 
 
-# --- State persistence ---
+# ── State persistence ─────────────────────────────────────────────────────────
 def load_state():
     if not os.path.exists(STATE_FILE):
         return {}
@@ -242,8 +376,16 @@ def save_state(streamer_list):
     except:
         pass
 
+def periodic_state_saver():
+    """Daemon thread: saves state every PERIODIC_SAVE_INTERVAL seconds."""
+    global stop
+    while not stop:
+        time.sleep(PERIODIC_SAVE_INTERVAL)
+        if not stop:
+            save_state(streamers)
 
-# --- liste.txt reading ---
+
+# ── liste.txt reading ─────────────────────────────────────────────────────────
 def read_liste():
     if not os.path.exists(LIST_FILE):
         print(f"\033[31m[!] ERROR: '{LIST_FILE}' not found!\033[0m")
@@ -261,7 +403,7 @@ def read_liste():
     return entries
 
 
-# --- Duration parsing ---
+# ── Duration parsing ──────────────────────────────────────────────────────────
 _DURATION_UNITS = {'w': 604800, 'd': 86400, 'h': 3600, 'm': 60, 's': 1}
 
 def parse_duration(text):
@@ -282,10 +424,10 @@ def parse_duration(text):
     return total if total > 0 else None
 
 
-# --- Channel info (per streamer) ---
+# ── Channel info (per streamer) ───────────────────────────────────────────────
 def get_channel_info_for(streamer):
     try:
-        s = tls_client.Session(client_identifier="chrome_120", random_tls_extension_order=True)
+        s = tls_client.Session(client_identifier=get_random_tls_id(), random_tls_extension_order=True)
         if all_ports:
             s.proxies = get_proxy_dict()
         s.headers.update({'Accept': 'application/json', 'User-Agent': get_random_ua()})
@@ -309,12 +451,12 @@ def get_channel_info_for(streamer):
     return None
 
 
-# --- Viewer count (per streamer) ---
+# ── Viewer count (per streamer) ───────────────────────────────────────────────
 def get_viewer_count_for(streamer):
     if not streamer.stream_id:
         return 0
     try:
-        s = tls_client.Session(client_identifier="chrome_120", random_tls_extension_order=True)
+        s = tls_client.Session(client_identifier=get_random_tls_id(), random_tls_extension_order=True)
         if all_ports:
             s.proxies = get_proxy_dict()
         s.headers.update({'Accept': 'application/json', 'User-Agent': get_random_ua()})
@@ -329,10 +471,10 @@ def get_viewer_count_for(streamer):
     return streamer.viewers
 
 
-# --- Token fetching ---
+# ── Token fetching ────────────────────────────────────────────────────────────
 def fetch_token(port=None):
     try:
-        s = tls_client.Session(client_identifier="chrome_120", random_tls_extension_order=True)
+        s = tls_client.Session(client_identifier=get_random_tls_id(), random_tls_extension_order=True)
         if all_ports:
             s.proxies = get_proxy_dict(port)
         s.headers.update({
@@ -348,12 +490,13 @@ def fetch_token(port=None):
         elif response.status_code == 403:
             if port:
                 blacklist_port(port)
+                update_port_health(port, -PORT_HEALTH_403_PENALTY)
     except:
         pass
     return None
 
 
-# --- Token producer with backoff ---
+# ── Token producer with backoff ───────────────────────────────────────────────
 def token_producer():
     global stop
     consecutive_failures = 0
@@ -363,7 +506,7 @@ def token_producer():
                 port = get_random_port()
                 token = fetch_token(port)
                 if token:
-                    token_queue.put((token, port))
+                    token_queue.put((token, port, time.time()))
                     consecutive_failures = 0
                 else:
                     consecutive_failures += 1
@@ -378,53 +521,99 @@ def token_producer():
             time.sleep(0.1)
 
 def get_token_from_pool():
+    """
+    Get a fresh token from the main pool.
+    Discards tokens older than TOKEN_MAX_AGE_SECONDS.
+    Returns (token, port) or (None, None).
+    """
     global token_hits, token_misses
-    try:
-        token, port = token_queue.get(timeout=0.1)
-        with lock:
-            token_hits += 1
-        return token, port
-    except Empty:
-        with lock:
-            token_misses += 1
-        return None, None
+    now = time.time()
+    while True:
+        try:
+            token, port, ts = token_queue.get(timeout=0.1)
+            if now - ts > TOKEN_MAX_AGE_SECONDS:
+                # Stale token — discard and try next
+                continue
+            with lock:
+                token_hits += 1
+            return token, port
+        except Empty:
+            with lock:
+                token_misses += 1
+            return None, None
 
 
-# --- Port assignment (proportional by target viewers) ---
-def assign_ports(streamer_list, available_ports):
-    active = [s for s in streamer_list if s.active]
-    if not active:
-        return
-    total_viewers = sum(s.target_viewers for s in active)
-    if total_viewers == 0:
-        return
-    port_list = list(available_ports)
-    random.shuffle(port_list)
-    start = 0
-    for i, s in enumerate(active):
-        if i == len(active) - 1:
-            s.assigned_ports = port_list[start:]
-        else:
-            count = max(1, int(len(port_list) * s.target_viewers / total_viewers))
-            s.assigned_ports = port_list[start:start + count]
-            start += count
+# ── Standby token pool ────────────────────────────────────────────────────────
+def get_standby_token(streamer):
+    """
+    Layer 3/5: Get a fresh standby token from the streamer's standby pool.
+    Discards tokens older than STANDBY_TTL or from cooling ports.
+    Returns (token, port, timestamp) or None.
+    """
+    now = time.time()
+    while True:
+        try:
+            item = streamer.standby_tokens.get_nowait()
+            token, port, ts = item
+            if now - ts < STANDBY_TTL and not is_port_cooling(port):
+                return item
+            # Stale or port in cooling — discard
+        except Empty:
+            return None
+
+def standby_producer(streamer):
+    """
+    Produces standby tokens for a streamer when the main pool has sufficient
+    tokens and the standby queue needs filling.
+    """
+    global stop
+    while not stop and streamer.active and not streamer.is_expired():
+        try:
+            needs_standby = streamer.standby_tokens.qsize() < STANDBY_MAX_PER_STREAMER
+            pool_healthy = token_queue.qsize() >= STANDBY_FILL_MIN_POOL
+            if needs_standby and pool_healthy:
+                port = get_random_healthy_port()
+                if port and get_port_health(port) >= PORT_HEALTH_STANDBY_THRESHOLD:
+                    token = fetch_token(port)
+                    if token:
+                        update_port_health(port, PORT_HEALTH_SUCCESS_BONUS)
+                        streamer.standby_tokens.put((token, port, time.time()))
+                    else:
+                        update_port_health(port, -PORT_HEALTH_FAIL_PENALTY)
+                else:
+                    time.sleep(5)
+            else:
+                time.sleep(5)
+        except:
+            time.sleep(5)
+
+def standby_health_checker(streamer):
+    """
+    Layer 1: Every 30s, drain the standby queue and discard tokens that are
+    older than STANDBY_TTL or whose port is in cooling mode.
+    """
+    global stop
+    while not stop and streamer.active:
+        time.sleep(30)
+        now = time.time()
+        fresh = []
+        while True:
+            try:
+                item = streamer.standby_tokens.get_nowait()
+                token, port, ts = item
+                if now - ts < STANDBY_TTL and not is_port_cooling(port):
+                    fresh.append(item)
+                # else discard stale/cooling-port token
+            except Empty:
+                break
+        for item in fresh:
+            streamer.standby_tokens.put(item)
 
 
-# --- Gradual ramp-up ---
-def get_ramp_target(streamer, port_target):
-    elapsed = (datetime.datetime.now() - streamer.start_time).total_seconds()
-    factor = RAMP_FULL_FRACTION
-    for threshold, f in RAMP_STAGES:
-        if elapsed < threshold:
-            factor = f
-            break
-    return max(1, int(port_target * factor))
-
-
-# --- Stats display ---
+# ── Stats display ─────────────────────────────────────────────────────────────
 def show_stats():
     global stop
-    n = 3 + len(streamers)
+    n = 4 + len(streamers)
     print("\n" * n)
     os.system('cls' if os.name == 'nt' else 'clear')
     while not stop:
@@ -433,17 +622,33 @@ def show_stats():
                 if time.time() - s.last_check >= 5:
                     get_viewer_count_for(s)
 
+            # Count healthy ports
+            now = time.time()
+            with port_health_lock:
+                healthy_ports = sum(
+                    1 for p in all_ports
+                    if port_health_scores.get(p, PORT_HEALTH_INITIAL) >= PORT_HEALTH_COOLING_THRESHOLD
+                    and port_cooling_until.get(p, 0) < now
+                )
+
             lines = [
-                f"\033[2K\r[+] Containers: \033[32m{len(containers)}\033[0m | Ports: \033[32m{len(all_ports)}\033[0m | TokenPool: \033[32m{token_queue.qsize()}\033[0m | Hits: \033[32m{token_hits}\033[0m | Miss: \033[31m{token_misses}\033[0m",
-                f"\033[2K\r{'Streamer':<20} {'Conn/Target':<15} {'Viewers':<10} {'Attempts':<10} {'Errors':<8} {'Remaining':<15}",
-                f"\033[2K\r{'-'*80}",
+                f"\033[2K\r[+] Containers: \033[32m{len(containers)}\033[0m | Ports: \033[32m{len(all_ports)}\033[0m"
+                f" | TokenPool: \033[32m{token_queue.qsize()}\033[0m"
+                f" | Hits: \033[32m{token_hits}\033[0m | Miss: \033[31m{token_misses}\033[0m"
+                f" | NEWNYM: \033[36m{total_newnyms}\033[0m",
+                f"\033[2K\r[+] Port Health: \033[32m{healthy_ports}/{len(all_ports)}\033[0m good"
+                f" | Version: \033[94mv{VERSION}\033[0m",
+                f"\033[2K\r{'Streamer':<20} {'Conn/Target':<15} {'Standby':<8} {'Viewers':<10} {'Attempts':<10} {'Errors':<8} {'Remaining':<15}",
+                f"\033[2K\r{'-'*88}",
             ]
             for s in streamers:
                 if s.active:
                     conn_str = f"{s.connections}/{s.target_viewers}"
                     remaining = s.format_remaining()
+                    standby_count = s.standby_tokens.qsize()
                     lines.append(
                         f"\033[2K\r{s.name:<20} \033[32m{conn_str:<15}\033[0m "
+                        f"\033[36m{standby_count:<8}\033[0m"
                         f"\033[32m{s.viewers:<10}\033[0m \033[32m{s.attempts:<10}\033[0m "
                         f"\033[31m{s.ws_errors:<8}\033[0m \033[33m{remaining:<15}\033[0m"
                     )
@@ -459,13 +664,25 @@ def show_stats():
             time.sleep(1)
 
 
-# --- WebSocket handler ---
-async def ws_handler(session, token, streamer):
+# ── WebSocket handler ─────────────────────────────────────────────────────────
+async def ws_handler(session, token, streamer, port, connect_timeout=30.0):
+    """
+    Handles a single WebSocket viewer connection.
+
+    port            — SOCKS proxy port used (for health score updates)
+    connect_timeout — seconds to wait for WS connect (2s for standby activation
+                      verification, 30s for normal connections)
+    """
     connected = False
     ws = None
     try:
         url = f"wss://websockets.kick.com/viewer/v1/connect?token={token}"
-        ws = await session.ws_connect(url, timeout=aiohttp.ClientTimeout(total=30))
+        ws = await session.ws_connect(
+            url,
+            timeout=aiohttp.ClientTimeout(total=connect_timeout, connect=connect_timeout),
+        )
+        # Layer 2/5: successful connect → boost port health
+        update_port_health(port, PORT_HEALTH_SUCCESS_BONUS)
         with lock:
             streamer.connections += 1
             streamer.pending_connections = max(0, streamer.pending_connections - 1)
@@ -507,10 +724,24 @@ async def ws_handler(session, token, streamer):
                     pass
 
                 if time.time() - last_activity > PONG_TIMEOUT:
+                    # Layer 2: timeout → penalise port health
+                    update_port_health(port, -PORT_HEALTH_TIMEOUT_PENALTY)
                     break
             except:
                 break
-    except:
+    except asyncio.TimeoutError:
+        # Layer 5: activation verification failed (2s timeout on standby tokens)
+        update_port_health(port, -PORT_HEALTH_TIMEOUT_PENALTY)
+        with lock:
+            streamer.ws_errors += 1
+            streamer.pending_connections = max(0, streamer.pending_connections - 1)
+    except Exception as e:
+        err_str = str(e)
+        if '403' in err_str:
+            update_port_health(port, -PORT_HEALTH_403_PENALTY)
+            blacklist_port(port)
+        else:
+            update_port_health(port, -PORT_HEALTH_FAIL_PENALTY)
         with lock:
             streamer.ws_errors += 1
             streamer.pending_connections = max(0, streamer.pending_connections - 1)
@@ -525,7 +756,7 @@ async def ws_handler(session, token, streamer):
                 streamer.connections = max(0, streamer.connections - 1)
 
 
-# --- Port pool runner (per port, serves all streamers) ---
+# ── Port pool runner (per port, serves all streamers) ─────────────────────────
 async def run_port_pool(port, streamer_list):
     global stop
     try:
@@ -545,7 +776,7 @@ async def run_port_pool(port, streamer_list):
                 if all(s.is_expired() for s in streamer_list if s.active):
                     break
 
-                # Token pool check — döngü dışında, tüm yayıncılar için
+                # Token pool check — wait for minimum supply
                 pool_size = token_queue.qsize()
                 if pool_size < 10:
                     await asyncio.sleep(1.0)
@@ -560,18 +791,17 @@ async def run_port_pool(port, streamer_list):
                     if not streamer.channel_id:
                         continue
 
-                    # Aktif taskları temizle
+                    # Clean finished tasks
                     streamer_tasks = active_tasks.get(streamer.name, set())
                     streamer_tasks = {t for t in streamer_tasks if not t.done()}
                     active_tasks[streamer.name] = streamer_tasks
 
-                    # Atomic reservation: lock ile kontrol et ve reserve et
+                    # Atomic reservation under lock
                     reserved = 0
                     with lock:
                         claimed = streamer.connections + streamer.pending_connections
                         available = streamer.target_viewers - claimed
                         if available > 0:
-                            # Bu port'ta zaten aktif task varsa gönderme
                             to_send = max(0, min(available, 1) - len(streamer_tasks))
                             if to_send > 0:
                                 streamer.pending_connections += to_send
@@ -580,33 +810,56 @@ async def run_port_pool(port, streamer_list):
                     if reserved <= 0:
                         continue
 
-                    # Token al ve bağlantı aç
                     actually_sent = 0
                     for _ in range(reserved):
                         if stop or streamer.is_expired():
                             break
-                        token, _ = get_token_from_pool()
-                        if not token:
-                            break
-                        with lock:
-                            streamer.attempts += 1
-                        task = asyncio.create_task(ws_handler(session, token, streamer))
-                        streamer_tasks.add(task)
-                        active_tasks[streamer.name] = streamer_tasks
-                        spawned_any = True
-                        actually_sent += 1
-                        if reserved > 1:
-                            await asyncio.sleep(random.uniform(MIN_SPAWN_DELAY, MAX_SPAWN_DELAY))
 
-                    # Gönderilemeyen reserved'ları geri ver
+                        # Layer B: try standby pool first for instant replacement
+                        standby = get_standby_token(streamer)
+                        if standby:
+                            s_token, s_port, _ = standby
+                            with lock:
+                                streamer.attempts += 1
+                            # Layer 5: activation verification — 2s connect timeout
+                            task = asyncio.create_task(
+                                ws_handler(session, s_token, streamer, s_port, connect_timeout=2.0)
+                            )
+                            streamer_tasks.add(task)
+                            active_tasks[streamer.name] = streamer_tasks
+                            spawned_any = True
+                            actually_sent += 1
+                        else:
+                            # Normal path: get token from main pool
+                            token, tok_port = get_token_from_pool()
+                            if not token:
+                                break
+                            with lock:
+                                streamer.attempts += 1
+                            task = asyncio.create_task(
+                                ws_handler(session, token, streamer, tok_port)
+                            )
+                            streamer_tasks.add(task)
+                            active_tasks[streamer.name] = streamer_tasks
+                            spawned_any = True
+                            actually_sent += 1
+                            if reserved > 1:
+                                await asyncio.sleep(random.uniform(MIN_SPAWN_DELAY, MAX_SPAWN_DELAY))
+
+                    # Return unreserved slots
                     not_sent = reserved - actually_sent
                     if not_sent > 0:
                         with lock:
                             streamer.pending_connections = max(0, streamer.pending_connections - not_sent)
 
-                # Ana döngü bekleme süresi
-                if spawned_any:
-                    await asyncio.sleep(random.uniform(0.5, 1.5))
+                # Layer A1: adaptive sleep — fast when below target, slow when at target
+                all_at_target = all(
+                    s.connections + s.pending_connections >= s.target_viewers
+                    for s in streamer_list
+                    if s.active and not s.is_expired() and s.channel_id
+                )
+                if spawned_any or not all_at_target:
+                    await asyncio.sleep(0.3)
                 else:
                     await asyncio.sleep(2.0)
     except:
@@ -633,11 +886,17 @@ def port_worker(port, streamer_list):
         loop.close()
 
 
-# --- Run all streamers ---
+# ── Run all streamers ─────────────────────────────────────────────────────────
 def run_all_streamers():
     global stop
 
     Thread(target=show_stats, daemon=True).start()
+    Thread(target=periodic_state_saver, daemon=True).start()
+    Thread(target=port_health_manager, daemon=True).start()
+
+    for streamer in streamers:
+        Thread(target=standby_producer, args=(streamer,), daemon=True).start()
+        Thread(target=standby_health_checker, args=(streamer,), daemon=True).start()
 
     threads = []
     for port in all_ports:
@@ -662,9 +921,9 @@ def run_all_streamers():
 if __name__ == "__main__":
     try:
         os.system('cls' if os.name == 'nt' else 'clear')
-        print("\033[94m" + "="*50)
-        print("   KICK VIEWER BOT - MULTI-TOR DOCKER EDITION   ")
-        print("="*50 + "\033[0m\n")
+        print("\033[94m" + "="*55)
+        print(f"   KICK VIEWER BOT - MULTI-TOR DOCKER EDITION v{VERSION}   ")
+        print("="*55 + "\033[0m\n")
 
         if not FULL_SUPPORT:
             print("\n\033[31m[!] Missing required libraries! Please run 'run.bat' or install manually:\033[0m")
@@ -750,6 +1009,9 @@ if __name__ == "__main__":
         num_containers = int(input("\nNumber of Containers (Recommended 10): ").strip() or "10")
         base_port = int(input("Starting Base Port (Default 19050): ").strip() or "19050")
 
+        # Store globally so send_newnym() can calculate container/tor indices
+        global_base_port = base_port
+
         print(f"\n[*] Creating {num_containers} containers. This may take a moment...")
         for i in range(num_containers):
             container_base = base_port + (i * PORTS_PER_CONTAINER)
@@ -758,6 +1020,11 @@ if __name__ == "__main__":
                 print(f"\n\033[33m[!] Warning: Could not create container {i+1}. Check Docker resources.\033[0m")
 
         print(f"\n\n\033[92m[+] Created {len(containers)} containers with {len(all_ports)} Tor ports!\033[0m")
+
+        # Initialise port health scores
+        with port_health_lock:
+            for p in all_ports:
+                port_health_scores[p] = PORT_HEALTH_INITIAL
 
         print("[*] Waiting 45s for Tor instances to bootstrap...")
         for i in range(45, 0, -1):
