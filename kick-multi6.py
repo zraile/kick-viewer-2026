@@ -112,7 +112,10 @@ STREAMER_CHECK_INTERVAL = 120
 
 # Error log settings
 MAX_ERROR_LOG = 15
-MAX_ERRORS_DISPLAYED = 5
+MAX_ERRORS_DISPLAYED = 8
+
+# Debug log file for detailed 403 error analysis (CF headers, response body)
+DEBUG_LOG_FILE = "error_debug.log"
 
 # Seconds to wait before the first streamer status check after startup
 INITIAL_STATUS_CHECK_DELAY = 30
@@ -163,6 +166,36 @@ port_403_backoff_lock = threading.Lock()
 streamers = []
 error_log = []
 error_log_lock = threading.Lock()
+debug_log_lock = threading.Lock()
+
+
+def write_debug_log(entry: str):
+    """Append a detailed debug entry to error_debug.log for offline analysis."""
+    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with debug_log_lock:
+        try:
+            with open(DEBUG_LOG_FILE, 'a', encoding='utf-8') as f:
+                f.write(f"[{ts}] {entry}\n")
+        except Exception:
+            pass
+
+
+# Error categories shown in the UI (prefix controls colour in show_stats)
+_ERROR_COLORS = {
+    "[CF-BLOCK]":       "\033[35m",   # magenta  — Cloudflare challenge/block
+    "[TOKEN-INVALID]":  "\033[31m",   # red       — Kick rejected the token
+    "[PROXY-TIMEOUT]":  "\033[33m",   # yellow    — SOCKS-layer timeout / refused
+    "[WS-ERROR]":       "\033[31m",   # red       — other WebSocket errors
+    "[STATUS]":         "\033[36m",   # cyan      — informational (streamer went live/offline)
+}
+_DEFAULT_ERROR_COLOR = "\033[31m"
+
+
+def _error_color(msg: str) -> str:
+    for prefix, color in _ERROR_COLORS.items():
+        if prefix in msg:
+            return color
+    return _DEFAULT_ERROR_COLOR
 
 
 def add_error_log(msg):
@@ -587,8 +620,8 @@ def get_ramp_target(streamer, port_target):
 # --- Stats display ---
 def show_stats():
     global stop
-    # Header + separator + streamers + 2 separators + "Recent Errors:" header + MAX_ERRORS_DISPLAYED error lines
-    n = 3 + len(streamers) + 2 + MAX_ERRORS_DISPLAYED
+    # Header + separator + streamers + 2 separators + legend + "Recent Errors:" header + MAX_ERRORS_DISPLAYED error lines
+    n = 3 + len(streamers) + 3 + MAX_ERRORS_DISPLAYED
     print("\n" * n)
     os.system('cls' if os.name == 'nt' else 'clear')
     while not stop:
@@ -597,8 +630,16 @@ def show_stats():
                 if time.time() - s.last_check >= 5:
                     get_viewer_count_for(s)
 
+            # Count active blacklisted ports for the status line
+            now = time.time()
+            with port_blacklist_lock:
+                bl_count = sum(1 for t in port_blacklist.values() if t > now)
+
             lines = [
-                f"\033[2K\r[+] Containers: \033[32m{len(containers)}\033[0m | Ports: \033[32m{len(all_ports)}\033[0m | TokenPool: \033[32m{token_queue.qsize()}\033[0m | Hits: \033[32m{token_hits}\033[0m | Miss: \033[31m{token_misses}\033[0m",
+                f"\033[2K\r[+] Containers: \033[32m{len(containers)}\033[0m | Ports: \033[32m{len(all_ports)}\033[0m"
+                f" | Blacklisted: \033[33m{bl_count}\033[0m"
+                f" | TokenPool: \033[32m{token_queue.qsize()}\033[0m"
+                f" | Hits: \033[32m{token_hits}\033[0m | Miss: \033[31m{token_misses}\033[0m",
                 f"\033[2K\r{'Streamer':<20} {'Conn/Target':<15} {'Viewers':<10} {'Attempts':<10} {'Errors':<8} {'Live':<6} {'Remaining':<15}",
                 f"\033[2K\r{'-'*80}",
             ]
@@ -615,14 +656,22 @@ def show_stats():
                 else:
                     lines.append(f"\033[2K\r{s.name:<20} \033[31mEXPIRED\033[0m")
 
-            # Error log section
+            # Error log section — colour-coded by category
             lines.append(f"\033[2K\r{'-'*80}")
-            lines.append(f"\033[2K\r\033[36mRecent Errors/Logs:\033[0m")
+            lines.append(
+                f"\033[2K\r\033[36mRecent Errors:\033[0m  "
+                f"\033[35m[CF-BLOCK]\033[0m Cloudflare  "
+                f"\033[31m[TOKEN-INVALID]\033[0m Kick token  "
+                f"\033[33m[PROXY-TIMEOUT]\033[0m Proxy  "
+                f"\033[31m[WS-ERROR]\033[0m Other"
+            )
+            lines.append(f"\033[2K\r{'-'*80}")
             with error_log_lock:
                 recent_errors = list(error_log[-MAX_ERRORS_DISPLAYED:])
             for i in range(MAX_ERRORS_DISPLAYED):
                 if i < len(recent_errors):
-                    lines.append(f"\033[2K\r  \033[31m{recent_errors[i]}\033[0m")
+                    color = _error_color(recent_errors[i])
+                    lines.append(f"\033[2K\r  {color}{recent_errors[i]}\033[0m")
                 else:
                     lines.append(f"\033[2K\r")
 
@@ -706,35 +755,50 @@ async def ws_handler(session, token, streamer, port=None):
                 break
     except aiohttp.WSServerHandshakeError as e:
         if e.status == 403:
-            # Server is actively blocking this proxy — apply exponential backoff.
-            # Duration doubles on each consecutive 403 for the same port (up to the cap)
-            # so that different ports become available again at staggered times,
-            # preventing the whole pool from recovering — and being re-banned — at once.
+            # Inspect the response headers to distinguish Cloudflare blocks from Kick token rejects.
+            resp_headers = dict(getattr(e, 'headers', None) or {})
+            cf_ray = resp_headers.get('cf-ray', resp_headers.get('Cf-Ray', ''))
+            server  = resp_headers.get('server', resp_headers.get('Server', ''))
+            body    = str(getattr(e, 'message', ''))
+
+            if cf_ray:
+                category = "[CF-BLOCK]"
+            else:
+                category = "[TOKEN-INVALID]"
+
+            # Write full details to error_debug.log for offline analysis
+            write_debug_log(
+                f"{category} streamer={streamer.name} port={port} "
+                f"cf-ray={cf_ray!r} server={server!r} "
+                f"headers={resp_headers!r} body={body!r}"
+            )
+
             if port:
                 duration, count = blacklist_port_403(port)
                 add_error_log(
-                    f"{streamer.name}: WS 403 Forbidden — blacklisting port {port} "
-                    f"for {duration}s (attempt #{count})"
+                    f"{category} {streamer.name}: port {port} blacklisted "
+                    f"{duration}s (attempt #{count})"
+                    + (f" cf-ray={cf_ray}" if cf_ray else "")
                 )
             else:
-                add_error_log(f"{streamer.name}: WS 403 Forbidden (no port to blacklist)")
+                add_error_log(f"{category} {streamer.name}: 403 Forbidden (no port)")
         else:
             await asyncio.sleep(random.uniform(MIN_ERROR_BACKOFF, MAX_ERROR_BACKOFF))
             with lock:
                 streamer.ws_errors += 1
-            add_error_log(f"{streamer.name}: WS error — WSServerHandshakeError {e.status}: {e.message}")
+            add_error_log(f"[WS-ERROR] {streamer.name}: WSServerHandshakeError {e.status}: {e.message}")
     except (ProxyTimeoutError, ProxyConnectionError) as e:
         # Proxy is dead or unreachable — blacklist briefly then rotate.
         # Not counted in ws_errors: this is a SOCKS-layer failure before any WS
         # handshake occurs. Port is blacklisted and event is logged instead.
         if port:
             blacklist_port(port, duration=PORT_TIMEOUT_BLACKLIST_DURATION)
-        add_error_log(f"{streamer.name}: Proxy error on port {port} — {type(e).__name__}: {e}")
+        add_error_log(f"[PROXY-TIMEOUT] {streamer.name}: port {port} — {type(e).__name__}: {e}")
     except Exception as e:
         await asyncio.sleep(random.uniform(MIN_ERROR_BACKOFF, MAX_ERROR_BACKOFF))
         with lock:
             streamer.ws_errors += 1
-        add_error_log(f"{streamer.name}: WS error — {type(e).__name__}: {e}")
+        add_error_log(f"[WS-ERROR] {streamer.name}: {type(e).__name__}: {e}")
     finally:
         if ws and not ws.closed:
             try:
@@ -765,6 +829,22 @@ async def run_port_pool(port, target_count, streamer):
             while not stop and not streamer.is_expired():
                 done = {t for t in active_tasks if t.done()}
                 active_tasks -= done
+
+                # ── Port-blacklist guard ─────────────────────────────────────
+                # If this port received a 403 and was blacklisted, do NOT spawn
+                # any new connections on it until the blacklist window expires.
+                # Without this check the loop would immediately re-queue tasks
+                # for the same port, burning through retries within a second.
+                now = time.time()
+                with port_blacklist_lock:
+                    bl_until = port_blacklist.get(port, 0)
+                if bl_until > now:
+                    wait_secs = bl_until - now
+                    # Sleep in short 10 s chunks so we can still react to
+                    # stop/expiry signals promptly even when the ban window is long.
+                    await asyncio.sleep(min(wait_secs, 10.0))
+                    continue
+                # ─────────────────────────────────────────────────────────────
 
                 # Pause new connections if streamer is offline
                 if not streamer.is_live:
@@ -864,18 +944,18 @@ def streamer_status_monitor():
             try:
                 get_channel_info_for(s)
             except Exception as e:
-                add_error_log(f"{s.name}: Status check error — {e}")
+                add_error_log(f"[STATUS] {s.name}: Status check error — {e}")
                 s.stream_id = prev_stream_id
                 s.last_status_check = now
                 continue
             s.last_status_check = time.time()
             if s.stream_id:
                 if not prev_live:
-                    add_error_log(f"{s.name}: Back ONLINE (Stream ID: {s.stream_id}), resuming connections")
+                    add_error_log(f"[STATUS] {s.name}: Back ONLINE (Stream ID: {s.stream_id}), resuming connections")
                 s.is_live = True
             else:
                 if prev_live:
-                    add_error_log(f"{s.name}: Went OFFLINE — pausing new connections")
+                    add_error_log(f"[STATUS] {s.name}: Went OFFLINE — pausing new connections")
                 s.is_live = False
 
 
