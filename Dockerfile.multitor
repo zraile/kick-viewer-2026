@@ -1,7 +1,13 @@
 FROM alpine:latest
 RUN apk add --no-cache tor
+# Pre-create Tor data directories and set permissions at build time
+RUN mkdir -p /var/lib/tor/data0 /var/lib/tor/data1 /var/lib/tor/data2 \
+             /var/lib/tor/data3 /var/lib/tor/data4 /var/lib/tor/data5 && \
+    chmod 700 /var/lib/tor/data*
 COPY torrc.template /etc/tor/torrc.template
 COPY start-tor.sh /start-tor.sh
 RUN chmod +x /start-tor.sh
 EXPOSE 9050-9055
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD nc -z 127.0.0.1 9050 || exit 1
 CMD ["/start-tor.sh"]

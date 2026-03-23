@@ -1256,11 +1256,54 @@ if __name__ == "__main__":
             for p in all_ports:
                 port_health_scores[p] = PORT_HEALTH_INITIAL
 
-        print("[*] Waiting 45s for Tor instances to bootstrap...")
-        for i in range(45, 0, -1):
+        print("[*] Waiting 90s for Tor instances to bootstrap...")
+        for i in range(90, 0, -1):
             print(f"\rTime Remaining: {i}s... ", end="", flush=True)
             time.sleep(1)
         print("\n")
+
+        # Verify containers are actually running
+        print("[*] Verifying container health...")
+        running_count = 0
+        for name in containers:
+            success, output = run_cmd(f"docker inspect -f '{{{{.State.Running}}}}' {name}")
+            if success and "true" in output.lower():
+                running_count += 1
+            else:
+                print(f"\033[33m[!] Container {name} is NOT running! Checking logs...\033[0m")
+                _, logs = run_cmd(f"docker logs --tail 20 {name}")
+                if logs:
+                    print(f"    Last logs: {logs[:200]}")
+
+        if running_count == 0:
+            print("\033[31m[!] CRITICAL: No containers are running! Tor failed to start.\033[0m")
+            print("    Try: docker logs multitor_0")
+            cleanup_containers()
+            sys.exit(1)
+        elif running_count < len(containers):
+            print(f"\033[33m[!] Warning: Only {running_count}/{len(containers)} containers are running.\033[0m")
+        else:
+            print(f"\033[92m[+] All {running_count} containers verified running.\033[0m")
+
+        # Quick port connectivity check
+        print("[*] Checking port connectivity...")
+        reachable = 0
+        unreachable_ports = []
+        check_ports = all_ports[:min(6, len(all_ports))]
+        for port in check_ports:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=3):
+                    reachable += 1
+            except (ConnectionRefusedError, OSError, socket.timeout):
+                unreachable_ports.append(port)
+
+        if reachable == 0:
+            print(f"\033[31m[!] CRITICAL: None of the first {len(check_ports)} ports are reachable: {unreachable_ports}\033[0m")
+            print("    Tor instances failed to bootstrap. Check: docker logs multitor_0")
+            cleanup_containers()
+            sys.exit(1)
+        else:
+            print(f"\033[92m[+] Port check: {reachable}/{len(check_ports)} ports reachable.\033[0m")
 
         # Get channel info for each streamer
         for s in streamers:
