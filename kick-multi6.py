@@ -77,6 +77,23 @@ RAMP_STAGES = [
 ]
 RAMP_FULL_FRACTION = 1.0
 
+# Streamer live-status check interval (seconds)
+STREAMER_CHECK_INTERVAL = 120
+
+# Error log settings
+MAX_ERROR_LOG = 15
+MAX_ERRORS_DISPLAYED = 5
+
+# Seconds to wait before the first streamer status check after startup
+INITIAL_STATUS_CHECK_DELAY = 30
+
+# Critical connection threshold (fraction of target below which emergency reconnect activates)
+CRITICAL_CONN_FRACTION = 0.15
+
+# Emergency reconnect batch size
+EMERGENCY_BATCH_SIZE = 10
+EMERGENCY_SPAWN_DELAY = 0.3
+
 # 15+ realistic User-Agent strings for rotation
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -112,6 +129,15 @@ all_ports = []
 port_blacklist = {}
 port_blacklist_lock = threading.Lock()
 streamers = []
+error_log = []
+error_log_lock = threading.Lock()
+
+
+def add_error_log(msg):
+    with error_log_lock:
+        error_log.append(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}")
+        while len(error_log) > MAX_ERROR_LOG:
+            error_log.pop(0)
 
 
 # --- StreamerInfo class ---
@@ -132,6 +158,8 @@ class StreamerInfo:
         self.ws_errors = 0
         self.active = True
         self.assigned_ports = []
+        self.is_live = True
+        self.last_status_check = 0.0
 
     def time_remaining(self):
         elapsed = (datetime.datetime.now() - self.start_time).total_seconds()
@@ -429,7 +457,8 @@ def get_ramp_target(streamer, port_target):
 # --- Stats display ---
 def show_stats():
     global stop
-    n = 3 + len(streamers)
+    # Header + separator + streamers + 2 separators + "Recent Errors:" header + MAX_ERRORS_DISPLAYED error lines
+    n = 3 + len(streamers) + 2 + MAX_ERRORS_DISPLAYED
     print("\n" * n)
     os.system('cls' if os.name == 'nt' else 'clear')
     while not stop:
@@ -440,20 +469,32 @@ def show_stats():
 
             lines = [
                 f"\033[2K\r[+] Containers: \033[32m{len(containers)}\033[0m | Ports: \033[32m{len(all_ports)}\033[0m | TokenPool: \033[32m{token_queue.qsize()}\033[0m | Hits: \033[32m{token_hits}\033[0m | Miss: \033[31m{token_misses}\033[0m",
-                f"\033[2K\r{'Streamer':<20} {'Conn/Target':<15} {'Viewers':<10} {'Attempts':<10} {'Errors':<8} {'Remaining':<15}",
+                f"\033[2K\r{'Streamer':<20} {'Conn/Target':<15} {'Viewers':<10} {'Attempts':<10} {'Errors':<8} {'Live':<6} {'Remaining':<15}",
                 f"\033[2K\r{'-'*80}",
             ]
             for s in streamers:
                 if s.active:
                     conn_str = f"{s.connections}/{s.target_viewers}"
                     remaining = s.format_remaining()
+                    live_str = "\033[32mYES\033[0m" if s.is_live else "\033[31mNO \033[0m"
                     lines.append(
                         f"\033[2K\r{s.name:<20} \033[32m{conn_str:<15}\033[0m "
                         f"\033[32m{s.viewers:<10}\033[0m \033[32m{s.attempts:<10}\033[0m "
-                        f"\033[31m{s.ws_errors:<8}\033[0m \033[33m{remaining:<15}\033[0m"
+                        f"\033[31m{s.ws_errors:<8}\033[0m {live_str:<14}\033[33m{remaining:<15}\033[0m"
                     )
                 else:
                     lines.append(f"\033[2K\r{s.name:<20} \033[31mEXPIRED\033[0m")
+
+            # Error log section
+            lines.append(f"\033[2K\r{'-'*80}")
+            lines.append(f"\033[2K\r\033[36mRecent Errors/Logs:\033[0m")
+            with error_log_lock:
+                recent_errors = list(error_log[-MAX_ERRORS_DISPLAYED:])
+            for i in range(MAX_ERRORS_DISPLAYED):
+                if i < len(recent_errors):
+                    lines.append(f"\033[2K\r  \033[31m{recent_errors[i]}\033[0m")
+                else:
+                    lines.append(f"\033[2K\r")
 
             print(f"\033[{n}A", end="")
             for line in lines:
@@ -514,10 +555,11 @@ async def ws_handler(session, token, streamer):
                     break
             except:
                 break
-    except:
+    except Exception as e:
         await asyncio.sleep(random.uniform(MIN_ERROR_BACKOFF, MAX_ERROR_BACKOFF))
         with lock:
             streamer.ws_errors += 1
+        add_error_log(f"{streamer.name}: WS error — {type(e).__name__}: {e}")
     finally:
         if ws and not ws.closed:
             try:
@@ -549,11 +591,16 @@ async def run_port_pool(port, target_count, streamer):
                 done = {t for t in active_tasks if t.done()}
                 active_tasks -= done
 
+                # Pause new connections if streamer is offline
+                if not streamer.is_live:
+                    await asyncio.sleep(5.0)
+                    continue
+
                 ramp_target = get_ramp_target(streamer, target_count)
                 slots = ramp_target - len(active_tasks)
                 pool_size = token_queue.qsize()
 
-                if pool_size < 50:
+                if pool_size < 20:
                     await asyncio.sleep(1.0)
                     continue
 
@@ -561,11 +608,22 @@ async def run_port_pool(port, target_count, streamer):
                     await asyncio.sleep(0.3)
                     continue
 
-                batch_size = (
-                    min(slots, 4) if pool_size > 200 else
-                    min(slots, 2) if pool_size > 50 else
-                    min(slots, 1)
+                # Emergency reconnect: connections critically low relative to target
+                is_critical = (
+                    streamer.target_viewers > 0 and
+                    streamer.connections < streamer.target_viewers * CRITICAL_CONN_FRACTION
                 )
+
+                if is_critical:
+                    batch_size = min(slots, EMERGENCY_BATCH_SIZE)
+                    spawn_delay = EMERGENCY_SPAWN_DELAY
+                else:
+                    batch_size = (
+                        min(slots, 4) if pool_size > 200 else
+                        min(slots, 2) if pool_size > 50 else
+                        min(slots, 1)
+                    )
+                    spawn_delay = random.uniform(MIN_SPAWN_DELAY, MAX_SPAWN_DELAY)
 
                 for _ in range(batch_size):
                     if stop or streamer.is_expired():
@@ -577,37 +635,73 @@ async def run_port_pool(port, target_count, streamer):
                         streamer.attempts += 1
                     task = asyncio.create_task(ws_handler(session, token, streamer))
                     active_tasks.add(task)
-                    await asyncio.sleep(random.uniform(MIN_SPAWN_DELAY, MAX_SPAWN_DELAY))
+                    await asyncio.sleep(spawn_delay)
 
                 await asyncio.sleep(random.uniform(MIN_BATCH_COOLDOWN, MAX_BATCH_COOLDOWN))
 
-                # Reconnect faster when connections dropped
-                if done:
-                    await asyncio.sleep(random.uniform(MIN_RECONNECT_DELAY, MAX_RECONNECT_DELAY))
-                else:
+                # When no connections dropped, slow down the loop slightly
+                if not done:
                     await asyncio.sleep(0.3)
     except:
         pass
 
 
 def port_worker(port, count, streamer):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(run_port_pool(port, count, streamer))
-    except:
-        pass
-    finally:
+    while not stop and not streamer.is_expired():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
-            pending = asyncio.all_tasks(loop)
-            for task in pending:
-                task.cancel()
-            if pending:
-                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(run_port_pool(port, count, streamer))
         except:
             pass
-        loop.close()
+        finally:
+            try:
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except:
+                pass
+            loop.close()
+        # Brief pause before restarting to avoid tight crash loops
+        if not stop and not streamer.is_expired():
+            time.sleep(random.uniform(MIN_RECONNECT_DELAY, MAX_RECONNECT_DELAY))
+
+
+# --- Streamer live-status monitor ---
+def streamer_status_monitor():
+    global stop
+    while not stop:
+        time.sleep(INITIAL_STATUS_CHECK_DELAY)
+        for s in streamers:
+            if stop or s.is_expired():
+                continue
+            now = time.time()
+            if now - s.last_status_check < STREAMER_CHECK_INTERVAL:
+                continue
+            prev_live = s.is_live
+            prev_stream_id = s.stream_id
+            # Temporarily reset stream_id so get_channel_info_for can detect offline state.
+            # On error, it is restored to avoid disrupting active ws_handler tasks.
+            s.stream_id = None
+            try:
+                get_channel_info_for(s)
+            except Exception as e:
+                add_error_log(f"{s.name}: Status check error — {e}")
+                s.stream_id = prev_stream_id
+                s.last_status_check = now
+                continue
+            s.last_status_check = time.time()
+            if s.stream_id:
+                if not prev_live:
+                    add_error_log(f"{s.name}: Back ONLINE (Stream ID: {s.stream_id}), resuming connections")
+                s.is_live = True
+            else:
+                if prev_live:
+                    add_error_log(f"{s.name}: Went OFFLINE — pausing new connections")
+                s.is_live = False
 
 
 # --- Run all streamers ---
@@ -615,6 +709,7 @@ def run_all_streamers():
     global stop
 
     Thread(target=show_stats, daemon=True).start()
+    Thread(target=streamer_status_monitor, daemon=True).start()
 
     threads = []
     for s in streamers:
