@@ -7,6 +7,7 @@ import threading
 import asyncio
 import json
 import os
+import ssl
 import subprocess
 from threading import Thread
 from queue import Queue, Empty
@@ -45,11 +46,18 @@ TOKEN_SCALE_VIEWERS = 50
 # Port blacklist duration (seconds) when a 403 is received
 PORT_BLACKLIST_DURATION = 180
 
-# Blacklist duration for 403 blocks from WS connect (longer — proxy is blocked)
+# Base blacklist duration for 403 blocks from WS connect (doubles on each repeat per port)
 PORT_403_BLACKLIST_DURATION = 360
+
+# Maximum blacklist duration for exponential 403 backoff (cap at 1 hour)
+PORT_403_MAX_BLACKLIST = 3600
 
 # Blacklist duration for proxy timeout / connection errors (shorter — may recover)
 PORT_TIMEOUT_BLACKLIST_DURATION = 90
+
+# Global WebSocket connection rate limit (new connections per second, across all streamers)
+GLOBAL_WS_RATE = 1.5      # sustained token refill rate (connections per second)
+GLOBAL_WS_CAPACITY = 3    # burst capacity — allows a small burst before throttling
 
 # Pre-connection per-slot jitter (seconds) — staggers WS handshakes within a batch
 MIN_PRECONNECT_JITTER = 0.1
@@ -150,6 +158,8 @@ containers = []
 all_ports = []
 port_blacklist = {}
 port_blacklist_lock = threading.Lock()
+port_403_backoff = {}        # port -> consecutive 403 count for exponential backoff
+port_403_backoff_lock = threading.Lock()
 streamers = []
 error_log = []
 error_log_lock = threading.Lock()
@@ -160,6 +170,78 @@ def add_error_log(msg):
         error_log.append(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}")
         while len(error_log) > MAX_ERROR_LOG:
             error_log.pop(0)
+
+
+# --- Global connection rate limiter (token bucket) ---
+class GlobalRateLimiter:
+    """
+    Thread-safe token-bucket limiter shared across all port-worker event loops.
+    Ensures the total number of new WebSocket connections opened per second
+    globally (across all streamers) never exceeds GLOBAL_WS_RATE, preventing
+    the mass-ban waves that exhaust the proxy pool all at once.
+    """
+
+    def __init__(self, rate, capacity):
+        self._tokens = float(capacity)
+        self._capacity = float(capacity)
+        self._rate = float(rate)   # tokens per second
+        self._last_refill = time.monotonic()
+        self._lock = threading.Lock()
+
+    def _refill(self):
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
+        self._last_refill = now
+
+    async def acquire(self):
+        """Yield to the running event loop while waiting for a rate-limit token."""
+        while True:
+            with self._lock:
+                self._refill()
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+            await asyncio.sleep(0.1)
+
+
+global_rate_limiter = GlobalRateLimiter(rate=GLOBAL_WS_RATE, capacity=GLOBAL_WS_CAPACITY)
+
+
+# --- Chrome-like TLS context for WebSocket connections ---
+def _build_chrome_ssl_context():
+    """
+    Return an SSL context whose cipher list mirrors Chrome 120's TLS handshake
+    order.  This reduces the distinctiveness of the JA3 fingerprint that
+    Cloudflare / Kick's WAF uses to identify automated clients.
+    """
+    ctx = ssl.create_default_context()
+    chrome_ciphers = (
+        "TLS_AES_128_GCM_SHA256:"
+        "TLS_AES_256_GCM_SHA384:"
+        "TLS_CHACHA20_POLY1305_SHA256:"
+        "ECDHE-ECDSA-AES128-GCM-SHA256:"
+        "ECDHE-RSA-AES128-GCM-SHA256:"
+        "ECDHE-ECDSA-AES256-GCM-SHA384:"
+        "ECDHE-RSA-AES256-GCM-SHA384:"
+        "ECDHE-ECDSA-CHACHA20-POLY1305:"
+        "ECDHE-RSA-CHACHA20-POLY1305:"
+        "ECDHE-RSA-AES128-SHA:"
+        "ECDHE-RSA-AES256-SHA:"
+        "AES128-GCM-SHA256:"
+        "AES256-GCM-SHA384:"
+        "AES128-SHA:"
+        "AES256-SHA"
+    )
+    try:
+        ctx.set_ciphers(chrome_ciphers)
+    except ssl.SSLError:
+        add_error_log("TLS fingerprint spoofing unavailable: cipher string unsupported on this platform")
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
+
+
+_chrome_ssl_ctx = _build_chrome_ssl_context()
 
 
 # --- StreamerInfo class ---
@@ -258,6 +340,32 @@ def get_random_port(port_pool=None):
 def blacklist_port(port, duration=PORT_BLACKLIST_DURATION):
     with port_blacklist_lock:
         port_blacklist[port] = time.time() + duration
+
+
+def blacklist_port_403(port):
+    """
+    Blacklist a port after a 403 response using exponential backoff.
+
+    The first block gives PORT_403_BLACKLIST_DURATION seconds; each subsequent
+    consecutive block for the same port doubles the penalty up to
+    PORT_403_MAX_BLACKLIST seconds.  This staggers recovery across the proxy
+    pool so that all ports do not become available again at the exact same moment
+    (which would trigger another simultaneous ban wave).
+    Returns (duration_applied, consecutive_count).
+    """
+    with port_403_backoff_lock:
+        count = port_403_backoff.get(port, 0) + 1
+        port_403_backoff[port] = count
+    capped_count = min(count, 5)  # cap exponent to avoid unnecessary large-integer arithmetic
+    duration = min(PORT_403_BLACKLIST_DURATION * (2 ** (capped_count - 1)), PORT_403_MAX_BLACKLIST)
+    blacklist_port(port, duration=duration)
+    return duration, count
+
+
+def reset_port_403_backoff(port):
+    """Reset the 403 exponential-backoff counter after a successful connection."""
+    with port_403_backoff_lock:
+        port_403_backoff.pop(port, None)
 
 def get_proxy_dict(port=None, port_pool=None):
     p = port if port else get_random_port(port_pool)
@@ -544,10 +652,18 @@ async def ws_handler(session, token, streamer, port=None):
         }
         # Per-connection jitter to spread out concurrent handshakes
         await asyncio.sleep(random.uniform(MIN_PRECONNECT_JITTER, MAX_PRECONNECT_JITTER))
-        ws = await session.ws_connect(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30))
+        # Global rate limiter — caps total new WS connections/second across all streamers
+        await global_rate_limiter.acquire()
+        ws = await session.ws_connect(
+            url, headers=headers, ssl=_chrome_ssl_ctx,
+            timeout=aiohttp.ClientTimeout(total=30),
+        )
         with lock:
             streamer.connections += 1
         connected = True
+        # Successful connection — clear any previous 403 backoff penalty for this port
+        if port:
+            reset_port_403_backoff(port)
 
         subscribe = {"event": "pusher:subscribe", "data": {"auth": "", "channel": f"channel.{streamer.channel_id}"}}
         await ws.send_str(json.dumps(subscribe))
@@ -590,12 +706,18 @@ async def ws_handler(session, token, streamer, port=None):
                 break
     except aiohttp.WSServerHandshakeError as e:
         if e.status == 403:
-            # Server is actively blocking this proxy — blacklist it for longer.
-            # Not counted in ws_errors: this is a proxy/IP block, not a WS protocol
-            # failure. The port is blacklisted and the event is logged instead.
+            # Server is actively blocking this proxy — apply exponential backoff.
+            # Duration doubles on each consecutive 403 for the same port (up to the cap)
+            # so that different ports become available again at staggered times,
+            # preventing the whole pool from recovering — and being re-banned — at once.
             if port:
-                blacklist_port(port, duration=PORT_403_BLACKLIST_DURATION)
-            add_error_log(f"{streamer.name}: WS 403 Forbidden — blacklisting port {port} for {PORT_403_BLACKLIST_DURATION}s")
+                duration, count = blacklist_port_403(port)
+                add_error_log(
+                    f"{streamer.name}: WS 403 Forbidden — blacklisting port {port} "
+                    f"for {duration}s (attempt #{count})"
+                )
+            else:
+                add_error_log(f"{streamer.name}: WS 403 Forbidden (no port to blacklist)")
         else:
             await asyncio.sleep(random.uniform(MIN_ERROR_BACKOFF, MAX_ERROR_BACKOFF))
             with lock:
