@@ -17,10 +17,12 @@ if sys.platform == 'win32':
 
 try:
     import aiohttp
-    from aiohttp_socks import ProxyConnector
+    from aiohttp_socks import ProxyConnector, ProxyTimeoutError, ProxyConnectionError
     FULL_SUPPORT = True
 except ImportError:
     FULL_SUPPORT = False
+    ProxyTimeoutError = Exception
+    ProxyConnectionError = Exception
 
 CLIENT_TOKEN = "e1393935a959b4020a4491574f6490129f678acdaa92760471263db43487f823"
 DOCKER_IMAGE = "multitor:latest"
@@ -42,6 +44,26 @@ TOKEN_SCALE_VIEWERS = 50
 
 # Port blacklist duration (seconds) when a 403 is received
 PORT_BLACKLIST_DURATION = 180
+
+# Blacklist duration for 403 blocks from WS connect (longer — proxy is blocked)
+PORT_403_BLACKLIST_DURATION = 360
+
+# Blacklist duration for proxy timeout / connection errors (shorter — may recover)
+PORT_TIMEOUT_BLACKLIST_DURATION = 90
+
+# Pre-connection per-slot jitter (seconds) — staggers WS handshakes within a batch
+MIN_PRECONNECT_JITTER = 0.1
+MAX_PRECONNECT_JITTER = 1.5
+
+# Accept-Language values rotated per connection for realism
+ACCEPT_LANGUAGES = [
+    "en-US,en;q=0.9",
+    "en-GB,en;q=0.9",
+    "en-US,en;q=0.8",
+    "en-CA,en;q=0.9",
+    "en-AU,en;q=0.9",
+    "en-US,en;q=0.8,tr;q=0.6",
+]
 
 # Token producer backoff settings
 BACKOFF_FAILURE_THRESHOLD = 5
@@ -506,12 +528,23 @@ def show_stats():
 
 
 # --- WebSocket handler ---
-async def ws_handler(session, token, streamer):
+async def ws_handler(session, token, streamer, port=None):
     connected = False
     ws = None
     try:
         url = f"wss://websockets.kick.com/viewer/v1/connect?token={token}"
-        ws = await session.ws_connect(url, timeout=aiohttp.ClientTimeout(total=30))
+        ua = get_random_ua()
+        headers = {
+            "Origin": "https://kick.com",
+            "User-Agent": ua,
+            "Accept-Language": random.choice(ACCEPT_LANGUAGES),
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Sec-WebSocket-Extensions": "permessage-deflate; client_max_window_bits",
+        }
+        # Per-connection jitter to spread out concurrent handshakes
+        await asyncio.sleep(random.uniform(MIN_PRECONNECT_JITTER, MAX_PRECONNECT_JITTER))
+        ws = await session.ws_connect(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30))
         with lock:
             streamer.connections += 1
         connected = True
@@ -555,6 +588,26 @@ async def ws_handler(session, token, streamer):
                     break
             except:
                 break
+    except aiohttp.WSServerHandshakeError as e:
+        if e.status == 403:
+            # Server is actively blocking this proxy — blacklist it for longer.
+            # Not counted in ws_errors: this is a proxy/IP block, not a WS protocol
+            # failure. The port is blacklisted and the event is logged instead.
+            if port:
+                blacklist_port(port, duration=PORT_403_BLACKLIST_DURATION)
+            add_error_log(f"{streamer.name}: WS 403 Forbidden — blacklisting port {port} for {PORT_403_BLACKLIST_DURATION}s")
+        else:
+            await asyncio.sleep(random.uniform(MIN_ERROR_BACKOFF, MAX_ERROR_BACKOFF))
+            with lock:
+                streamer.ws_errors += 1
+            add_error_log(f"{streamer.name}: WS error — WSServerHandshakeError {e.status}: {e.message}")
+    except (ProxyTimeoutError, ProxyConnectionError) as e:
+        # Proxy is dead or unreachable — blacklist briefly then rotate.
+        # Not counted in ws_errors: this is a SOCKS-layer failure before any WS
+        # handshake occurs. Port is blacklisted and event is logged instead.
+        if port:
+            blacklist_port(port, duration=PORT_TIMEOUT_BLACKLIST_DURATION)
+        add_error_log(f"{streamer.name}: Proxy error on port {port} — {type(e).__name__}: {e}")
     except Exception as e:
         await asyncio.sleep(random.uniform(MIN_ERROR_BACKOFF, MAX_ERROR_BACKOFF))
         with lock:
@@ -633,7 +686,7 @@ async def run_port_pool(port, target_count, streamer):
                         break
                     with lock:
                         streamer.attempts += 1
-                    task = asyncio.create_task(ws_handler(session, token, streamer))
+                    task = asyncio.create_task(ws_handler(session, token, streamer, port=port))
                     active_tasks.add(task)
                     await asyncio.sleep(spawn_delay)
 
