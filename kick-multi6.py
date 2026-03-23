@@ -28,7 +28,7 @@ except ImportError:
     FULL_SUPPORT = False
 
 # ── Core settings ─────────────────────────────────────────────────────────────
-CLIENT_TOKEN = "e1393935a959b4020a4491574f6490129f678acdaa92760471263db43487f823"
+CLIENT_TOKEN = os.environ.get("KICK_CLIENT_TOKEN", "e1393935a959b4020a4491574f6490129f678acdaa92760471263db43487f823")
 DOCKER_IMAGE = "multitor:latest"
 CONTAINER_PREFIX = "multitor_"
 PORTS_PER_CONTAINER = 6
@@ -233,7 +233,8 @@ def run_cmd(cmd):
     try:
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
         return result.returncode == 0, result.stdout.strip()
-    except:
+    except Exception as exc:
+        logger.debug(f"[CMD]     error running command: {exc}")
         return False, ""
 
 def build_image():
@@ -436,7 +437,8 @@ def load_state():
     try:
         with open(STATE_FILE, 'r') as f:
             return json.load(f)
-    except:
+    except Exception as exc:
+        logger.debug(f"[STATE]   failed to load state: {exc}")
         return {}
 
 def save_state(streamer_list):
@@ -450,8 +452,8 @@ def save_state(streamer_list):
     try:
         with open(STATE_FILE, 'w') as f:
             json.dump(data, f, indent=2)
-    except:
-        pass
+    except Exception as exc:
+        logger.warning(f"[STATE]   failed to save state: {exc}")
 
 def periodic_state_saver():
     """Daemon thread: saves state every PERIODIC_SAVE_INTERVAL seconds."""
@@ -478,6 +480,78 @@ def read_liste():
     if not entries:
         print(f"\033[31m[!] ERROR: '{LIST_FILE}' is empty or has no valid entries.\033[0m")
     return entries
+
+
+# Hot-reload interval (seconds): re-read liste.txt every 60 minutes
+LISTE_RELOAD_INTERVAL = 3600
+
+
+def liste_hot_reloader():
+    """
+    Daemon thread: every LISTE_RELOAD_INTERVAL seconds, re-reads liste.txt.
+    - Streamers removed from the file are deactivated.
+    - New streamers present in state.json are resumed automatically.
+    - New streamers not in state.json are logged; restart to configure them.
+    """
+    global stop
+    while not stop:
+        for _ in range(LISTE_RELOAD_INTERVAL):
+            if stop:
+                return
+            time.sleep(1)
+
+        logger.info(f"[RELOAD]  hot-reload: re-reading {LIST_FILE}")
+        try:
+            entries = read_liste()
+        except Exception as exc:
+            logger.warning(f"[RELOAD]  failed to read {LIST_FILE}: {exc}")
+            continue
+
+        current_names = {s.name for s in streamers}
+        new_names = {clean_channel_name(e) for e in entries}
+
+        # Deactivate streamers removed from liste.txt
+        for streamer in streamers:
+            if streamer.name not in new_names and streamer.active:
+                streamer.active = False
+                logger.info(f"[RELOAD]  {streamer.name} removed from {LIST_FILE} — deactivated")
+
+        # Add new streamers found in liste.txt
+        state = load_state()
+        state_streamers = state.get("streamers", {})
+        added = 0
+        for entry in entries:
+            name = clean_channel_name(entry)
+            if name in current_names:
+                continue
+            if name in state_streamers:
+                s_data = state_streamers[name]
+                start_time_dt = datetime.datetime.fromisoformat(s_data["start_time"])
+                duration_secs = s_data["duration_seconds"]
+                target_viewers = s_data["target_viewers"]
+                si = StreamerInfo(name, target_viewers, duration_secs, start_time_dt)
+                if si.is_expired():
+                    logger.info(f"[RELOAD]  {name}: found in state.json but expired — skipping")
+                    continue
+                streamers.append(si)
+                Thread(target=standby_producer, args=(si,), daemon=True).start()
+                Thread(target=standby_health_checker, args=(si,), daemon=True).start()
+                get_channel_info_for(si)
+                logger.info(
+                    f"[RELOAD]  {name}: resumed from state.json"
+                    f" | target: {target_viewers} | remaining: {si.format_remaining()}"
+                )
+                added += 1
+            else:
+                logger.info(
+                    f"[RELOAD]  {name}: new streamer found in {LIST_FILE} but not in state.json"
+                    f" — restart the bot to configure viewer count and duration"
+                )
+
+        if added:
+            logger.info(f"[RELOAD]  hot-reload complete: {added} new streamer(s) added")
+        else:
+            logger.info(f"[RELOAD]  hot-reload complete: no new streamers added")
 
 
 # ── Duration parsing ──────────────────────────────────────────────────────────
@@ -543,8 +617,8 @@ def get_viewer_count_for(streamer):
             if isinstance(data, list) and len(data) > 0:
                 streamer.viewers = data[0].get('viewers', 0)
                 streamer.last_check = time.time()
-    except:
-        pass
+    except Exception as exc:
+        logger.debug(f"[VIEWER]  [{streamer.name}] error fetching viewer count: {exc}")
     return streamer.viewers
 
 
@@ -625,8 +699,9 @@ def token_producer():
             else:
                 time.sleep(0.05)
                 consecutive_failures = 0
-        except:
+        except Exception as exc:
             consecutive_failures += 1
+            logger.debug(f"[TOKEN]   producer error: {exc}")
             time.sleep(0.1)
 
 def get_token_from_pool():
@@ -701,7 +776,8 @@ def standby_producer(streamer):
                     time.sleep(5)
             else:
                 time.sleep(5)
-        except:
+        except Exception as exc:
+            logger.debug(f"[STANDBY] [{streamer.name}] producer error: {exc}")
             time.sleep(5)
 
 def standby_health_checker(streamer):
@@ -796,7 +872,8 @@ def show_stats():
                 last_log_time = now
 
             time.sleep(1)
-        except:
+        except Exception as exc:
+            logger.debug(f"[STATS]   display error: {exc}")
             time.sleep(1)
 
 
@@ -892,7 +969,7 @@ async def ws_handler(session, token, streamer, port, connect_timeout=30.0):
         if ws and not ws.closed:
             try:
                 await ws.close()
-            except:
+            except Exception:
                 pass
         if connected:
             with lock:
@@ -908,7 +985,8 @@ async def run_port_pool(port, streamer_list):
             limit=CONNS_PER_PORT,
             limit_per_host=CONNS_PER_PORT,
         )
-    except:
+    except Exception as exc:
+        logger.warning(f"[PORT]    port:{port} | failed to create connector: {exc}")
         return
 
     try:
@@ -1013,8 +1091,8 @@ async def run_port_pool(port, streamer_list):
                     await asyncio.sleep(0.3)
                 else:
                     await asyncio.sleep(2.0)
-    except:
-        pass
+    except Exception as exc:
+        logger.debug(f"[PORT]    port:{port} | pool error: {exc}")
 
 
 def port_worker(port, streamer_list):
@@ -1022,8 +1100,8 @@ def port_worker(port, streamer_list):
     asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(run_port_pool(port, streamer_list))
-    except:
-        pass
+    except Exception as exc:
+        logger.debug(f"[WORKER]  port:{port} | worker error: {exc}")
     finally:
         try:
             pending = asyncio.all_tasks(loop)
@@ -1032,8 +1110,8 @@ def port_worker(port, streamer_list):
             if pending:
                 loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             loop.run_until_complete(loop.shutdown_asyncgens())
-        except:
-            pass
+        except Exception as exc:
+            logger.debug(f"[WORKER]  port:{port} | cleanup error: {exc}")
         loop.close()
 
 
@@ -1044,6 +1122,7 @@ def run_all_streamers():
     Thread(target=show_stats, daemon=True).start()
     Thread(target=periodic_state_saver, daemon=True).start()
     Thread(target=port_health_manager, daemon=True).start()
+    Thread(target=liste_hot_reloader, daemon=True).start()
 
     for streamer in streamers:
         Thread(target=standby_producer, args=(streamer,), daemon=True).start()
