@@ -440,9 +440,6 @@ def get_channel_info_for(streamer: StreamerInfo) -> Optional[int]:
         s = tls_client.Session(
             client_identifier="chrome_120", random_tls_extension_order=True
         )
-        proxy = proxy_fetcher.get()
-        if proxy:
-            s.proxies = {"http": proxy, "https": proxy}
         s.headers.update({
             "Accept": "application/json",
             "User-Agent": get_random_ua(),
@@ -469,10 +466,8 @@ def get_channel_info_for(streamer: StreamerInfo) -> Optional[int]:
         elif response.status_code == 403:
             print(
                 f"\033[31m[!] Blocked by Kick API (403) for '{streamer.name}'. "
-                "Trying next proxy…\033[0m"
+                "Your IP may be rate-limited — consider waiting before retrying.\033[0m"
             )
-            if proxy:
-                proxy_fetcher.mark_bad(proxy)
         else:
             print(
                 f"\033[31m[!] Unexpected API response for '{streamer.name}' "
@@ -490,9 +485,6 @@ def get_viewer_count_for(streamer: StreamerInfo) -> int:
         s = tls_client.Session(
             client_identifier="chrome_120", random_tls_extension_order=True
         )
-        proxy = proxy_fetcher.get()
-        if proxy:
-            s.proxies = {"http": proxy, "https": proxy}
         s.headers.update({
             "Accept": "application/json",
             "User-Agent": get_random_ua(),
