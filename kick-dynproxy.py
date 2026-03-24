@@ -184,6 +184,8 @@ streamers: List["StreamerInfo"] = []
 error_log: List[str] = []
 error_log_lock = threading.Lock()
 debug_log_lock = threading.Lock()
+ui_lock = threading.Event()
+active_token_producers: int = 0
 
 
 def write_debug_log(entry: str) -> None:
@@ -551,6 +553,19 @@ def read_liste() -> List[str]:
     return entries
 
 
+def _read_liste_silent() -> List[str]:
+    if not os.path.exists(LIST_FILE):
+        return []
+    entries: List[str] = []
+    with open(LIST_FILE, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            entries.append(line)
+    return entries
+
+
 # ---------------------------------------------------------------------------
 # Duration parsing
 # ---------------------------------------------------------------------------
@@ -584,6 +599,9 @@ def show_stats() -> None:
     print("\n" * n)
     os.system("cls" if os.name == "nt" else "clear")
     while not stop:
+        if ui_lock.is_set():
+            ui_lock.wait(timeout=1)
+            continue
         try:
             for s in streamers:
                 if time.time() - s.last_check >= 5:
@@ -963,6 +981,74 @@ def streamer_status_monitor() -> None:
                 s.is_live = False
 
 
+
+# ---------------------------------------------------------------------------
+# Liste watcher — hot-reload new streamers while bot is running
+# ---------------------------------------------------------------------------
+def liste_watcher_monitor() -> None:
+    global streamers, active_token_producers, TOKEN_PRODUCERS
+    while not stop:
+        time.sleep(10)
+        try:
+            entries = _read_liste_silent()
+            known_names = {clean_channel_name(s.name) for s in streamers}
+            for entry in entries:
+                new_name = clean_channel_name(entry)
+                if new_name in known_names:
+                    continue
+
+                # New streamer detected — pause stats display
+                ui_lock.set()
+                time.sleep(1.5)
+                os.system("cls" if os.name == "nt" else "clear")
+                print(f"\n[*] New streamer detected in liste.txt: {new_name}")
+
+                while True:
+                    try:
+                        v = input(f"\nHow many viewers for {new_name}? : ").strip()
+                        target_viewers = int(v)
+                        if target_viewers > 0:
+                            break
+                        print("[!] Please enter a positive number.")
+                    except ValueError:
+                        print("[!] Please enter a valid number.")
+
+                while True:
+                    dur_input = input(
+                        f"Duration for {new_name} (e.g. 7d, 2h, 30m, 1w): "
+                    ).strip()
+                    duration_secs = parse_duration(dur_input)
+                    if duration_secs:
+                        break
+                    print("[!] Invalid duration format. Examples: 7d, 2h, 30m, 1w, 45m")
+
+                si = StreamerInfo(new_name, target_viewers, duration_secs)
+                get_channel_info_for(si)
+                streamers.append(si)
+                assign_workers([si])
+
+                new_total = sum(s.target_viewers for s in streamers if s.active)
+                calculate_token_settings(new_total)
+
+                if TOKEN_PRODUCERS > active_token_producers:
+                    extra = TOKEN_PRODUCERS - active_token_producers
+                    for _ in range(extra):
+                        Thread(target=token_producer, daemon=True).start()
+                    active_token_producers = TOKEN_PRODUCERS
+
+                save_state(streamers)
+
+                conns_per_worker = max(1, math.ceil(si.target_viewers / max(1, si.num_workers)))
+                for w_id in range(si.num_workers):
+                    t = Thread(target=proxy_worker, args=(w_id, conns_per_worker, si), daemon=True)
+                    t.start()
+
+                known_names.add(new_name)
+                ui_lock.clear()
+        except Exception as exc:
+            add_error_log(f"[STATUS] liste_watcher error: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Run all streamers
 # ---------------------------------------------------------------------------
@@ -971,6 +1057,7 @@ def run_all_streamers() -> None:
 
     Thread(target=show_stats, daemon=True).start()
     Thread(target=streamer_status_monitor, daemon=True).start()
+    Thread(target=liste_watcher_monitor, daemon=True).start()
 
     threads: List[Thread] = []
     for s in streamers:
@@ -1145,6 +1232,8 @@ if __name__ == "__main__":
         # 5. Start token producers
         # ------------------------------------------------------------------
         print("[*] Starting token producers…")
+        global active_token_producers
+        active_token_producers = TOKEN_PRODUCERS
         for _ in range(TOKEN_PRODUCERS):
             Thread(target=token_producer, daemon=True).start()
 
