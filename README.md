@@ -140,12 +140,49 @@ streamer3            29/30           31         189        1        01:44:22
 ## Anti-Block Features
 
 - **17 rotating User-Agents** — every token fetch and WebSocket connection uses a different realistic UA string.
-- **Random connection delays** — `0.5–2.0s` between clients to avoid burst patterns.
+- **Random connection delays** — `1.5–4.0s` between clients to avoid burst patterns (configurable, see below).
 - **Randomized ping intervals** — `15–25s` instead of a fixed 20s.
 - **Proxy rotation** — every WebSocket connection uses its own randomly chosen proxy.
 - **Bad proxy eviction** — proxies that fail in production are immediately removed from the pool.
 - **Gradual ramp-up** — connections scale up over the first 4 minutes.
 - **Token producer backoff** — consecutive failures increase wait time automatically.
+- **Token fetch pacing** — a small configurable delay between successful token fetches prevents rate-limiting on the Kick token API.
+
+---
+
+## Connection Delay Tuning
+
+Because fast datacenter proxies can trigger Cloudflare's rate-limiting (HTTP 429) or DDoS protection if all bots connect simultaneously, the bot introduces randomised delays between connection attempts. You can tune these delays via **environment variables** without editing the source code:
+
+| Variable | Default | Description |
+|---|---|---|
+| `MIN_CONNECTION_DELAY` | `1.5` | Minimum seconds between each new WebSocket connection spawn |
+| `MAX_CONNECTION_DELAY` | `4.0` | Maximum seconds between each new WebSocket connection spawn |
+| `MIN_PRECONNECT_JITTER` | `0.1` | Minimum extra pre-handshake jitter inside each connection |
+| `MAX_PRECONNECT_JITTER` | `1.5` | Maximum extra pre-handshake jitter inside each connection |
+| `TOKEN_FETCH_DELAY` | `0.1` | Seconds to wait between successful token fetches |
+
+### Example (Windows)
+
+```bat
+set MIN_CONNECTION_DELAY=1.0
+set MAX_CONNECTION_DELAY=3.0
+set TOKEN_FETCH_DELAY=0.2
+python kick-dynproxy.py
+```
+
+### Example (Linux / macOS)
+
+```bash
+export MIN_CONNECTION_DELAY=1.0
+export MAX_CONNECTION_DELAY=3.0
+export TOKEN_FETCH_DELAY=0.2
+python kick-dynproxy.py
+```
+
+> **Tip:** Larger `MIN/MAX_CONNECTION_DELAY` values make the ramp-up slower but greatly reduce the chance of proxy bans. Start with the defaults; increase them if you see HTTP 429 errors in `error_debug.log`.
+
+Already-connected bots are **not** affected by these delays — they continue sending keep-alive pings normally while new bots join gradually in the background.
 
 ---
 
