@@ -1232,7 +1232,6 @@ if __name__ == "__main__":
         # 5. Start token producers
         # ------------------------------------------------------------------
         print("[*] Starting token producers…")
-        global active_token_producers
         active_token_producers = TOKEN_PRODUCERS
         for _ in range(TOKEN_PRODUCERS):
             Thread(target=token_producer, daemon=True).start()
