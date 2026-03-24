@@ -34,20 +34,10 @@ if %errorlevel% neq 0 (
     exit /b
 )
 
-:: 3. Check Docker
-echo [*] Checking Docker installation...
-docker --version >nul 2>&1
-if %errorlevel% neq 0 (
-    echo %RED%[!] ERROR: Docker not found!%RESET%
-    echo Please install Docker Desktop to use this bot.
-    pause
-    exit /b
-)
-
-:: 4. Final Launch
+:: 3. Final Launch
 echo %GREEN%[+] Everything is ready! Starting the bot...%RESET%
 echo.
-python kick-multi6.py
+python kick-dynproxy.py
 
 if %errorlevel% neq 0 (
     echo.
