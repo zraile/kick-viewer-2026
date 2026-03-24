@@ -1,8 +1,8 @@
 """
-Multi-Source Dynamic Proxy Fetcher & Validator
-===============================================
-Downloads proxy lists from several actively-maintained GitHub repositories,
-deduplicates them, validates each proxy against a lightweight endpoint, and
+Dynamic Proxy Fetcher & Validator
+==================================
+Downloads the proxy list from the Proxifly free-proxy-list repository,
+deduplicates entries, validates each proxy against a lightweight endpoint, and
 maintains a thread-safe pool of healthy proxies that the rest of the bot can
 consume at any time.
 
@@ -39,32 +39,8 @@ logger = logging.getLogger(__name__)
 # Proxy source URLs (raw TXT – one "ip:port" or "scheme://ip:port" per line)
 # ---------------------------------------------------------------------------
 PROXY_SOURCES: List[str] = [
-    # GitHub Sources
     # Proxifly – refreshed every 5 minutes, ~3,000-4,000 proxies, all protocols
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
-    # ProxyScraper – refreshed every 30 minutes, mixed protocols
-    "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/refs/heads/main/proxies.txt",
-    # TheSpeedX – large SOCKS5/SOCKS4/HTTP lists, frequently updated
-    "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
-    "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks4.txt",
-    "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
-    # vakhov – fresh-proxy-list, SOCKS5 subset, updated every 5-20 minutes
-    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks5.txt",
-    # monosans – all protocols, updated frequently
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/all.txt",
-
-    # External APIs & Services (Frequently Updated)
-    # ProxyScrape API – real-time SOCKS5/SOCKS4/HTTP lists
-    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=all&ssl=all&anonymity=all",
-    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks4&timeout=10000&country=all&ssl=all&anonymity=all",
-    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all",
-    # proxy-list.download API – updated every few minutes
-    "https://www.proxy-list.download/api/v1/get?type=socks5",
-    "https://www.proxy-list.download/api/v1/get?type=socks4",
-    "https://www.proxy-list.download/api/v1/get?type=http",
-    # Spys.me – frequently updated SOCKS and HTTP lists
-    "https://spys.me/socks.txt",
-    "https://spys.me/proxy.txt",
 ]
 
 # Lightweight URL used to validate that a proxy can reach the internet.
