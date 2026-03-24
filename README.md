@@ -1,38 +1,35 @@
-# Kick Viewer Bot (Multi-Tor Docker)
+# Kick Viewer Bot (Dynamic Proxy Edition)
 
-A robust Kick.com viewbot using Docker and multiple Tor instances to bypass rate limits. Now supports **multiple streamers simultaneously**, persistent session timers, auto-reconnect, and anti-block improvements.
+A robust Kick.com viewer bot that uses a **multi-source dynamic proxy pool** to bypass rate limits. Supports **multiple streamers simultaneously**, persistent session timers, auto-reconnect, and anti-block improvements.
+
+No Docker or TOR required.
 
 ## The Easy Way (Recommended)
 
-**Prerequisite:** Make sure **Docker Desktop** is installed and **WSL 2** is enabled in Docker settings (Settings > General > Use the WSL 2 based engine).
-
-1. **Start Docker Desktop** and wait for it to initialize.
-2. **Edit `liste.txt`** — add streamer names or kick.com links, one per line.
-3. **Double-click `run.bat`**.
-4. The script will automatically:
+1. **Edit `liste.txt`** — add streamer names or kick.com links, one per line.
+2. **Double-click `run.bat`**.
+3. The script will automatically:
    - Verify your Python installation.
    - Install or update all required libraries from `requirements.txt`.
-   - Confirm Docker is running.
-   - Build the multitor image if it's missing.
-   - Launch the bot directly.
+   - Download and validate fresh proxies from multiple public sources.
+   - Launch the bot.
 
 ---
 
 ## Requirements
 
 - Python 3.8+
-- Docker Desktop
-- Windows 10/11
+- Windows 10/11 (or any OS with Python)
+- Internet connection (proxies are fetched automatically)
 
 ## Files
 
-| File | Description | Tor per Container |
-|------|-------------|-------------------|
-| `kick-single.py` | Simple version, 1 Tor instance per container | 1 |
-| `kick-multi6.py` | **Recommended** — Multi-Tor, multi-streamer version, 6 Tor instances per container | 6 |
-| `kick-multi3.py` | Lightweight version, 3 Tor instances per container | 3 |
-| `liste.txt` | Streamer list — one name or kick.com link per line | — |
-| `state.json` | Auto-generated session state (persistent timers) | — |
+| File | Description |
+|------|-------------|
+| `kick-dynproxy.py` | **Main bot** — multi-streamer, dynamic proxy edition |
+| `proxy_fetcher.py` | Background proxy downloader and validator |
+| `liste.txt` | Streamer list — one name or kick.com link per line |
+| `state.json` | Auto-generated session state (persistent timers) |
 
 ---
 
@@ -53,19 +50,18 @@ streamer3
 ## Usage (Manual)
 
 ```bash
-python kick-multi6.py
+python kick-dynproxy.py
 ```
 
 ### Startup Flow
 
-1. The bot reads `liste.txt` and shows how many streamers were found.
-2. For **new** streamers (not in `state.json`), it asks:
+1. The bot downloads and validates fresh proxies from multiple public sources (~60-90s).
+2. The bot reads `liste.txt` and shows how many streamers were found.
+3. For **new** streamers (not in `state.json`), it asks:
    - How many viewers to assign
    - How long to run (supports `7d`, `2h`, `30m`, `1w`, `45m`, etc.)
-3. For **existing** streamers (already in `state.json` with time remaining), it resumes automatically — no prompts needed.
-4. Enter container count and base port.
-5. Wait for Tor bootstrap (~45s).
-6. The bot starts routing viewers to all streamers proportionally.
+4. For **existing** streamers (already in `state.json` with time remaining), it resumes automatically — no prompts needed.
+5. The bot starts routing viewers to all streamers proportionally via the dynamic proxy pool.
 
 ### Example Session
 
@@ -97,6 +93,19 @@ Duration for streamer3 (e.g. 7d, 2h, 30m, 1w): 2h
 
 ---
 
+## Proxy System
+
+Proxies are fetched automatically from multiple actively-maintained public sources:
+
+- **Proxifly** — refreshed every 5 minutes, ~3,000-4,000 proxies
+- **ProxyScraper** — refreshed every 30 minutes
+- **TheSpeedX SOCKS5 list** — large list, frequently updated
+- **vakhov fresh-proxy-list** — SOCKS5 subset, updated every 5-20 minutes
+
+Only proxies that pass a live validation check (latency ≤ 6 seconds) are used. The pool refreshes automatically every 3 hours. Failed proxies are removed from the pool immediately.
+
+---
+
 ## Persistent Timer (`state.json`)
 
 The bot saves each streamer's start time, duration, and target viewer count to `state.json`. When you restart the bot:
@@ -112,7 +121,7 @@ The bot saves each streamer's start time, duration, and target viewer count to `
 ## Stats Display
 
 ```
-[+] Containers: 10 | Ports: 60 | TokenPool: 487 | Hits: 1234 | Miss: 12
+[+] Proxy Pool: 842 | TokenPool: 487 | Hits: 1234 | Miss: 12
 Streamer             Conn/Target     Viewers    Attempts   Errors   Remaining
 --------------------------------------------------------------------------------
 streamer1            48/50           52         312        3        6d 22:14:09
@@ -133,24 +142,16 @@ streamer3            29/30           31         189        1        01:44:22
 - **17 rotating User-Agents** — every token fetch and WebSocket connection uses a different realistic UA string.
 - **Random connection delays** — `0.5–2.0s` between clients to avoid burst patterns.
 - **Randomized ping intervals** — `15–25s` instead of a fixed 20s.
-- **Port blacklisting** — ports that return 403 are blocked for 120 seconds; the bot automatically picks a different port.
-- **Gradual ramp-up** — connections scale up over the first 2 minutes (25% → 50% → 75% → 100%).
-- **Token producer backoff** — consecutive failures increase wait time up to 5s.
+- **Proxy rotation** — every WebSocket connection uses its own randomly chosen proxy.
+- **Bad proxy eviction** — proxies that fail in production are immediately removed from the pool.
+- **Gradual ramp-up** — connections scale up over the first 4 minutes.
+- **Token producer backoff** — consecutive failures increase wait time automatically.
 
 ---
 
 ## Auto-Reconnect
 
-When a WebSocket connection drops, the port pool loop immediately detects the completed task and spawns a new connection with a fresh token (with a 1–5s random reconnect delay). Viewer counts are maintained continuously.
-
----
-
-## Enhanced Error Management
-
-- **Docker Check:** If Docker Desktop is closed, the bot reports it clearly.
-- **Kick API Validation:** Reports if the channel is offline, not found, or hitting Cloudflare blocks.
-- **Tor Readiness:** A live countdown shows bootstrap progress.
-- **Smart Cleanup:** On Ctrl+C, state is saved and all Docker containers are removed automatically.
+When a WebSocket connection drops, the worker immediately spawns a new connection with a fresh token and a different proxy (with a random reconnect delay). Viewer counts are maintained continuously.
 
 ---
 
