@@ -396,10 +396,20 @@ def get_ramp_target(streamer: StreamerInfo, target: int) -> int:
 # Channel / viewer helpers
 # ---------------------------------------------------------------------------
 def clean_channel_name(name: str) -> str:
-    if "kick.com/" in name:
-        parts = name.split("kick.com/")
-        ch = parts[1].split("/")[0].split("?")[0]
-        return ch.lower()
+    # Use proper URL parsing to extract the channel slug from a kick.com URL.
+    # Accepts exact "kick.com" or valid subdomains (e.g. "www.kick.com").
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(name if "://" in name else f"https://{name}")
+        hostname = parsed.hostname or ""
+        if hostname == "kick.com" or hostname.endswith(".kick.com"):
+            path = parsed.path.strip("/")
+            # Take the first path segment as the channel name
+            ch = path.split("/")[0].split("?")[0]
+            if ch:
+                return ch.lower()
+    except Exception:
+        pass
     return name.lower()
 
 
