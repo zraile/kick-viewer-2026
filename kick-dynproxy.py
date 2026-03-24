@@ -75,8 +75,10 @@ TOKEN_SCALE_VIEWERS: int = 50
 
 TOKEN_TTL_SECONDS: int = 120
 
-MIN_PRECONNECT_JITTER: float = 0.1
-MAX_PRECONNECT_JITTER: float = 1.5
+# Per-connection pre-connect jitter (applied inside ws_handler before the
+# WebSocket handshake).  Tune via env vars to spread individual handshakes.
+MIN_PRECONNECT_JITTER: float = float(os.getenv("MIN_PRECONNECT_JITTER", "0.1"))
+MAX_PRECONNECT_JITTER: float = float(os.getenv("MAX_PRECONNECT_JITTER", "1.5"))
 
 ACCEPT_LANGUAGES: List[str] = [
     "en-US,en;q=0.9",
@@ -94,8 +96,25 @@ MAX_BACKOFF_SECONDS: float = 2.0
 MIN_PING_INTERVAL: int = 15
 MAX_PING_INTERVAL: int = 25
 
-MIN_SPAWN_DELAY: float = 1.5
-MAX_SPAWN_DELAY: float = 4.0
+# ---------------------------------------------------------------------------
+# Connection ramp-up / jitter
+# ---------------------------------------------------------------------------
+# Randomised delay injected between consecutive WebSocket connection attempts
+# inside run_proxy_worker_pool.  Raising these values slows the ramp-up,
+# which reduces the risk of Cloudflare rate-limiting (HTTP 429) or proxy bans
+# when using fast datacenter proxies.
+#
+# Override at runtime via environment variables, e.g.:
+#   set MIN_CONNECTION_DELAY=1.0   (Windows)
+#   export MIN_CONNECTION_DELAY=1.0  (Linux/macOS)
+MIN_CONNECTION_DELAY: float = float(os.getenv("MIN_CONNECTION_DELAY", "1.5"))
+MAX_CONNECTION_DELAY: float = float(os.getenv("MAX_CONNECTION_DELAY", "4.0"))
+
+# Delay injected between successful token-fetch calls in token_producer.
+# A small pause here prevents hammering the Kick token endpoint and avoids
+# triggering Cloudflare's per-IP rate limits on the token API.
+# Override via:  export TOKEN_FETCH_DELAY=0.2
+TOKEN_FETCH_DELAY: float = float(os.getenv("TOKEN_FETCH_DELAY", "0.1"))
 
 MIN_RECONNECT_DELAY: int = 3
 MAX_RECONNECT_DELAY: int = 8
@@ -332,6 +351,9 @@ def token_producer() -> None:
                 if token:
                     token_queue.put((token, proxy, time.time()))
                     consecutive_failures = 0
+                    # Small delay between successful fetches to avoid
+                    # rate-limiting (HTTP 429) on the Kick token endpoint.
+                    time.sleep(TOKEN_FETCH_DELAY)
                 else:
                     consecutive_failures += 1
                     if consecutive_failures > BACKOFF_FAILURE_THRESHOLD:
@@ -858,7 +880,7 @@ async def run_proxy_worker_pool(
                 else min(slots, 2) if token_queue.qsize() > 50
                 else min(slots, 1)
             )
-            spawn_delay = random.uniform(MIN_SPAWN_DELAY, MAX_SPAWN_DELAY)
+            spawn_delay = random.uniform(MIN_CONNECTION_DELAY, MAX_CONNECTION_DELAY)
 
         for _ in range(batch_size):
             if stop or streamer.is_expired():
