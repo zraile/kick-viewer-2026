@@ -39,14 +39,32 @@ logger = logging.getLogger(__name__)
 # Proxy source URLs (raw TXT – one "ip:port" or "scheme://ip:port" per line)
 # ---------------------------------------------------------------------------
 PROXY_SOURCES: List[str] = [
+    # GitHub Sources
     # Proxifly – refreshed every 5 minutes, ~3,000-4,000 proxies, all protocols
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
     # ProxyScraper – refreshed every 30 minutes, mixed protocols
     "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/refs/heads/main/proxies.txt",
-    # TheSpeedX – large SOCKS5 list, frequently updated
+    # TheSpeedX – large SOCKS5/SOCKS4/HTTP lists, frequently updated
     "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks4.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
     # vakhov – fresh-proxy-list, SOCKS5 subset, updated every 5-20 minutes
     "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks5.txt",
+    # monosans – all protocols, updated frequently
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/all.txt",
+
+    # External APIs & Services (Frequently Updated)
+    # ProxyScrape API – real-time SOCKS5/SOCKS4/HTTP lists
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=all&ssl=all&anonymity=all",
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks4&timeout=10000&country=all&ssl=all&anonymity=all",
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all",
+    # proxy-list.download API – updated every few minutes
+    "https://www.proxy-list.download/api/v1/get?type=socks5",
+    "https://www.proxy-list.download/api/v1/get?type=socks4",
+    "https://www.proxy-list.download/api/v1/get?type=http",
+    # Spys.me – frequently updated SOCKS and HTTP lists
+    "https://spys.me/socks.txt",
+    "https://spys.me/proxy.txt",
 ]
 
 # Lightweight URL used to validate that a proxy can reach the internet.
@@ -242,6 +260,7 @@ def _parse_proxies(lines: List[str]) -> List[str]:
         1.2.3.4:1080
         socks5://1.2.3.4:1080
         http://1.2.3.4:8080
+        1.1.1.1:8080 US-N-S +    (e.g. Spys.me – extra metadata is stripped)
     """
     seen: Set[str] = set()
     result: List[str] = []
@@ -249,6 +268,13 @@ def _parse_proxies(lines: List[str]) -> List[str]:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
+
+        # Strip out extra country codes/metadata some lists provide (e.g. Spys.me)
+        parts = line.split()
+        if not parts:
+            continue
+        line = parts[0]
+
         if "://" not in line:
             line = f"{DEFAULT_SCHEME}://{line}"
         if line not in seen:
