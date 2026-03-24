@@ -32,10 +32,10 @@ PORTS_PER_CONTAINER = 6
 CONNS_PER_PORT = 80
 BASE_TOKEN_POOL_SIZE = 500
 BASE_INITIAL_POOL_WAIT = 150
-BASE_TOKEN_PRODUCERS = 60
+BASE_TOKEN_PRODUCERS = 80
 TOKEN_POOL_SIZE = 500
 INITIAL_POOL_WAIT = 150
-TOKEN_PRODUCERS = 60
+TOKEN_PRODUCERS = 80
 PONG_TIMEOUT = 90  # Reduced from 180s to drop dead connections faster and free slots sooner
 STATE_FILE = "state.json"
 LIST_FILE = "liste.txt"
@@ -55,9 +55,8 @@ PORT_403_MAX_BLACKLIST = 3600
 # Blacklist duration for proxy timeout / connection errors (shorter — may recover)
 PORT_TIMEOUT_BLACKLIST_DURATION = 90
 
-# Global WebSocket connection rate limit (new connections per second, across all streamers)
-GLOBAL_WS_RATE = 1.5      # sustained token refill rate (connections per second)
-GLOBAL_WS_CAPACITY = 3    # burst capacity — allows a small burst before throttling
+# Token freshness: tokens older than this many seconds are silently discarded
+TOKEN_TTL_SECONDS = 120   # 2 minutes — Kick tokens expire quickly
 
 # Pre-connection per-slot jitter (seconds) — staggers WS handshakes within a batch
 MIN_PRECONNECT_JITTER = 0.1
@@ -73,10 +72,10 @@ ACCEPT_LANGUAGES = [
     "en-US,en;q=0.8,tr;q=0.6",
 ]
 
-# Token producer backoff settings
-BACKOFF_FAILURE_THRESHOLD = 5
+# Token producer backoff settings (keep aggressive to replenish fresh tokens quickly)
+BACKOFF_FAILURE_THRESHOLD = 3
 BACKOFF_MULTIPLIER = 0.5
-MAX_BACKOFF_SECONDS = 5.0
+MAX_BACKOFF_SECONDS = 2.0
 
 # Ping interval randomization range (seconds) — anti-block
 MIN_PING_INTERVAL = 15
@@ -203,42 +202,6 @@ def add_error_log(msg):
         error_log.append(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}")
         while len(error_log) > MAX_ERROR_LOG:
             error_log.pop(0)
-
-
-# --- Global connection rate limiter (token bucket) ---
-class GlobalRateLimiter:
-    """
-    Thread-safe token-bucket limiter shared across all port-worker event loops.
-    Ensures the total number of new WebSocket connections opened per second
-    globally (across all streamers) never exceeds GLOBAL_WS_RATE, preventing
-    the mass-ban waves that exhaust the proxy pool all at once.
-    """
-
-    def __init__(self, rate, capacity):
-        self._tokens = float(capacity)
-        self._capacity = float(capacity)
-        self._rate = float(rate)   # tokens per second
-        self._last_refill = time.monotonic()
-        self._lock = threading.Lock()
-
-    def _refill(self):
-        now = time.monotonic()
-        elapsed = now - self._last_refill
-        self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
-        self._last_refill = now
-
-    async def acquire(self):
-        """Yield to the running event loop while waiting for a rate-limit token."""
-        while True:
-            with self._lock:
-                self._refill()
-                if self._tokens >= 1.0:
-                    self._tokens -= 1.0
-                    return
-            await asyncio.sleep(0.1)
-
-
-global_rate_limiter = GlobalRateLimiter(rate=GLOBAL_WS_RATE, capacity=GLOBAL_WS_CAPACITY)
 
 
 # --- Chrome-like TLS context for WebSocket connections ---
@@ -559,7 +522,7 @@ def token_producer():
                 port = get_random_port()
                 token = fetch_token(port)
                 if token:
-                    token_queue.put((token, port))
+                    token_queue.put((token, port, time.time()))
                     consecutive_failures = 0
                 else:
                     consecutive_failures += 1
@@ -575,15 +538,21 @@ def token_producer():
 
 def get_token_from_pool():
     global token_hits, token_misses
-    try:
-        token, port = token_queue.get(timeout=0.1)
-        with lock:
-            token_hits += 1
-        return token, port
-    except Empty:
-        with lock:
-            token_misses += 1
-        return None, None
+    now = time.time()
+    # Drain stale tokens (up to 200 at a time) until a fresh one is found
+    for _ in range(200):
+        try:
+            token, port, ts = token_queue.get(timeout=0.1)
+            if now - ts <= TOKEN_TTL_SECONDS:
+                with lock:
+                    token_hits += 1
+                return token, port
+            # Token is expired — silently discard and try the next one
+        except Empty:
+            break
+    with lock:
+        token_misses += 1
+    return None, None
 
 
 # --- Port assignment (proportional by target viewers) ---
@@ -701,8 +670,6 @@ async def ws_handler(session, token, streamer, port=None):
         }
         # Per-connection jitter to spread out concurrent handshakes
         await asyncio.sleep(random.uniform(MIN_PRECONNECT_JITTER, MAX_PRECONNECT_JITTER))
-        # Global rate limiter — caps total new WS connections/second across all streamers
-        await global_rate_limiter.acquire()
         ws = await session.ws_connect(
             url, headers=headers, ssl=_chrome_ssl_ctx,
             timeout=aiohttp.ClientTimeout(total=30),
@@ -773,15 +740,19 @@ async def ws_handler(session, token, streamer, port=None):
                 f"headers={resp_headers!r} body={body!r}"
             )
 
-            if port:
-                duration, count = blacklist_port_403(port)
-                add_error_log(
-                    f"{category} {streamer.name}: port {port} blacklisted "
-                    f"{duration}s (attempt #{count})"
-                    + (f" cf-ray={cf_ray}" if cf_ray else "")
-                )
+            if category == "[CF-BLOCK]":
+                # Real Cloudflare block — blacklist the proxy with exponential backoff
+                if port:
+                    duration, count = blacklist_port_403(port)
+                    add_error_log(
+                        f"[CF-BLOCK] {streamer.name}: port {port} blacklisted "
+                        f"{duration}s (attempt #{count}) cf-ray={cf_ray}"
+                    )
+                else:
+                    add_error_log(f"[CF-BLOCK] {streamer.name}: 403 Cloudflare block (no port)")
             else:
-                add_error_log(f"{category} {streamer.name}: 403 Forbidden (no port)")
+                # Dead/expired token — the proxy is fine; just discard the token and move on
+                add_error_log(f"[TOKEN-INVALID] {streamer.name}: dead token on port {port}, fresh token will be used on next attempt")
         else:
             await asyncio.sleep(random.uniform(MIN_ERROR_BACKOFF, MAX_ERROR_BACKOFF))
             with lock:
